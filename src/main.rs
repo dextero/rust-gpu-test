@@ -114,7 +114,7 @@ impl GpuAnsiEncoder {
             });
             compute_pass.set_pipeline(&self.calc_sizes_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(texture.size().width, texture.size().height, 1);
+            compute_pass.dispatch_workgroups(texture.size().width, (texture.size().height + 1) / 2, 1);
         }
         {
             let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
@@ -137,7 +137,7 @@ impl GpuAnsiEncoder {
             });
             compute_pass.set_pipeline(&self.prefix_sum_pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_pixels.try_into()?, 1, 1);
+            compute_pass.dispatch_workgroups(1, 1, 1);
         }
         {
             let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
