@@ -15,13 +15,12 @@ struct Appender {
     dest_off: u32,
 }
 
-fn pad(appender: ptr<function, Appender>) -> u32 {
+fn pad(appender: ptr<function, Appender>) {
     const padding: array<u32, 3> = array<u32, 3>(ANSI_ESCAPE, ASCII_LEFT_BRACKET, ASCII_ZERO + 3);
     let padding_needed = (4 - appender.acc_shift / 8) % 4;
     for (var i = 0u; i < padding_needed; i += 1) {
         append(appender, padding[i]);
     }
-    return padding_needed;
 }
 
 fn flush(appender: ptr<function, Appender>) {
@@ -102,7 +101,5 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     append(&appender, UTF8_UPPER_HALF_BLOCK[0]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[1]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[2]);
-    if (pad(&appender) > 0) {
-        flush(&appender);
-    }
+    pad(&appender);
 }
