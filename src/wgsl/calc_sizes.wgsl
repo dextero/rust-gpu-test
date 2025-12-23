@@ -20,23 +20,23 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let top = textureLoad(input, pos_top, 0);
 
-    // \x1b[38;RRR;GGG;BBBm
-    //         ^^^ ^^^ ^^^                      
-    //          '---'---'---------------------------------- 1-3 * 3
-    // ^~~~^^^^   ^   ^   ^                                 8 fixed chars
-    //                     \x1b[48;RRR;GGG;BBBm
-    //                             ^^^ ^^^ ^^^                      
-    //                              '---'---'-------------- 1-3 * 3
-    //                     ^~~~^^^^   ^   ^   ^^~~~^~~~^~~~ 8 fixed chars
-    //                                         \xe2\x96\x80
-    //                                         ^~~~^~~~^~~~ 3 fixed chars
-    //                                                     \n if at EOL
-    var len = 11u; // 8 fixed + 3 for upper half block
+    // \x1b[38;2;RRR;GGG;BBBm
+    //           ^^^ ^^^ ^^^                      
+    //            '---'---'------------------------------------ 1-3 * 3
+    // ^~~~^^^^^^   ^   ^   ^                                   10 fixed chars
+    //                       \x1b[48;2;RRR;GGG;BBBm
+    //                                 ^^^ ^^^ ^^^                      
+    //                                  '---'---'-------------- 1-3 * 3
+    //                       ^~~~^^^^^^ ^   ^     ^             10 fixed chars
+    //                                             \xe2\x96\x80
+    //                                             ^~~~^~~~^~~~ 3 fixed chars
+    //                                                         \n if at EOL
+    var len = 13u; // 10 fixed + 3 for upper half block
     len += get_digits_len(top.r) + get_digits_len(top.g) + get_digits_len(top.b);
     // Only add the second escape if there is an odd row
     if (pos_bot.y < tex_dims.y) {
         let bot = textureLoad(input, pos_bot, 0);
-        len += 8u; // 8 fixed
+        len += 10u; // 10 fixed
         len += get_digits_len(bot.r) + get_digits_len(bot.g) + get_digits_len(bot.b);
     }
     
