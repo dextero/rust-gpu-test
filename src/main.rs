@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     let device = Rc::new(device);
     let queue = Rc::new(queue);
 
-    const SIZE: (usize, usize) = (4, 3);
+    const SIZE: (usize, usize) = (40, 30);
     let pixels: Vec<u8> = gen_pixels(SIZE.0, SIZE.1);
     let texture = device.create_texture_with_data(
         &queue,
@@ -274,7 +274,7 @@ async fn main() -> Result<()> {
 
     let ansi_encoder = GpuAnsiEncoder::new(device, queue).await?;
     let s = ansi_encoder.ansi_from_texture(&texture).await?;
-    println!("{s}");
+    println!("{s}\x1b[0m");
 
     Ok(())
 }

@@ -109,6 +109,10 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     append(&appender, UTF8_UPPER_HALF_BLOCK[1]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[2]);
     if (id.x == tex_dims.x - 1) {
+        append(&appender, ANSI_ESCAPE);
+        append(&appender, ASCII_LEFT_BRACKET);
+        append(&appender, ASCII_ZERO);
+        append(&appender, ASCII_LOWERCASE_M);
         append(&appender, ASCII_NEWLINE);
     }
     pad(&appender);

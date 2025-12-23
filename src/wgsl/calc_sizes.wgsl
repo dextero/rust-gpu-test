@@ -41,7 +41,7 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     
     // Add newline if at the end of a row
-    if (id.x == tex_dims.x - 1) { len += 1u; } // "\n"
+    if (id.x == tex_dims.x - 1) { len += 5u; } // "\n"
 
     let out_idx = id.y * tex_dims.x + id.x;
     sizes[out_idx] = len;
