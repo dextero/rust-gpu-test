@@ -1,9 +1,9 @@
 use anyhow::Result;
 use std::{borrow::Cow, rc::Rc};
 use wgpu::{
-    BindGroupDescriptor, BufferDescriptor, BufferUsages, ComputePipeline, Device, MapMode, Queue,
-    ShaderModuleDescriptor, ShaderSource, Texture, TextureFormat, TextureUsages, util::DeviceExt,
-    wgt::TextureDescriptor,
+    BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages,
+    ComputePipeline, Device, MapMode, Queue, ShaderModuleDescriptor, ShaderSource, Texture,
+    TextureFormat, TextureUsages, util::DeviceExt, wgt::TextureDescriptor,
 };
 
 struct GpuAnsiEncoder {
@@ -16,25 +16,27 @@ struct GpuAnsiEncoder {
 
 impl GpuAnsiEncoder {
     pub async fn new(device: Rc<Device>, queue: Rc<Queue>) -> Result<Self> {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("ansi_encoder"),
-            source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
-        });
+        macro_rules! get_pipeline {
+            ($src:literal) => {{
+                let shader = device.create_shader_module(ShaderModuleDescriptor {
+                    label: Some($src),
+                    source: ShaderSource::Wgsl(Cow::Borrowed(include_str!($src))),
+                });
 
-        let get_pipeline = |entry_point: &str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry_point),
-                layout: None,
-                module: &shader,
-                entry_point: Some(entry_point),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some($src),
+                    layout: None,
+                    module: &shader,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            }};
+        }
 
-        let calc_sizes_pipeline = get_pipeline("calc_sizes");
-        let prefix_sum_pipeline = get_pipeline("prefix_sum");
-        let encode_pipeline = get_pipeline("encode");
+        let calc_sizes_pipeline = get_pipeline!("wgsl/calc_sizes.wgsl");
+        let prefix_sum_pipeline = get_pipeline!("wgsl/prefix_sum.wgsl");
+        let encode_pipeline = get_pipeline!("wgsl/encode_ansi.wgsl");
 
         Ok(Self {
             device,
@@ -59,10 +61,16 @@ impl GpuAnsiEncoder {
             * "\x1b[38;2;255;255;255m\x1b48;2;255;255;255m\u{2580}"
                 .as_bytes()
                 .len();
-        let output_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output"),
+        let output_device_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("ansi_output_device"),
             size: max_output_size_bytes.try_into()?,
-            usage: BufferUsages::STORAGE,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let output_host_buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("ansi_output_host"),
+            size: max_output_size_bytes.try_into()?,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
@@ -72,66 +80,86 @@ impl GpuAnsiEncoder {
                 label: Some("encode_ansi"),
             });
         let texture_view = texture.create_view(&Default::default());
-        let input_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &self.calc_sizes_pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_view),
-            }],
-        });
-        let offsets_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &self.calc_sizes_pipeline.get_bind_group_layout(1),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: offsets_buffer.as_entire_binding(),
-            }],
-        });
-        let output_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &self.calc_sizes_pipeline.get_bind_group_layout(2),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: output_buffer.as_entire_binding(),
-            }],
-        });
 
         {
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("calc_sizes_bind_group"),
+                layout: &self.calc_sizes_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&texture_view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: offsets_buffer.as_entire_binding(),
+                    },
+                ],
+            });
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("calc_sizes"),
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.calc_sizes_pipeline);
-            compute_pass.set_bind_group(0, &input_bind_group, &[]);
-            compute_pass.set_bind_group(1, &offsets_bind_group, &[]);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
             compute_pass.dispatch_workgroups(texture.size().width, texture.size().height, 1);
         }
         {
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("prefix_sum_bind_group"),
+                layout: &self.prefix_sum_pipeline.get_bind_group_layout(0),
+                entries: &[BindGroupEntry {
+                    binding: 0,
+                    resource: offsets_buffer.as_entire_binding(),
+                }],
+            });
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("prefix_sum"),
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.prefix_sum_pipeline);
-            compute_pass.set_bind_group(1, &offsets_bind_group, &[]);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
             compute_pass.dispatch_workgroups(num_pixels.try_into()?, 1, 1);
         }
         {
+            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("encode_ansi_bind_group"),
+                layout: &self.encode_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&texture_view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: offsets_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: output_device_buffer.as_entire_binding(),
+                    },
+                ],
+            });
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("encode_ansi"),
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.encode_pipeline);
-            compute_pass.set_bind_group(0, &input_bind_group, &[]);
-            compute_pass.set_bind_group(1, &offsets_bind_group, &[]);
-            compute_pass.set_bind_group(2, &output_bind_group, &[]);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
             compute_pass.dispatch_workgroups(num_pixels.try_into()?, 1, 1);
         }
 
+        encoder.copy_buffer_to_buffer(
+            &output_device_buffer,
+            0,
+            &output_host_buffer,
+            0,
+            output_host_buffer.size(),
+        );
         self.queue.submit(Some(encoder.finish()));
 
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        output_buffer.map_async(MapMode::Read, .., move |result| {
+        output_host_buffer.map_async(MapMode::Read, .., move |result| {
             sender.send(result).unwrap();
         });
         self.device.poll(wgpu::wgt::PollType::Wait {
@@ -141,7 +169,7 @@ impl GpuAnsiEncoder {
         receiver.await??;
 
         // TODO: check bounds
-        let bytes = output_buffer.get_mapped_range(..).to_vec();
+        let bytes = output_host_buffer.get_mapped_range(..).to_vec();
         let s = unsafe { String::from_utf8_unchecked(bytes) };
         Ok(s)
     }
