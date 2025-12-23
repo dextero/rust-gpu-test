@@ -73,15 +73,16 @@ impl GpuAnsiEncoder {
             * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}"
                 .as_bytes()
                 .len();
+        let rounded_max_output_size_bytes = (max_output_size_bytes + 3) / 4 * 4;
         let output_device_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("ansi_output_device"),
-            size: max_output_size_bytes.try_into()?,
+            size: rounded_max_output_size_bytes.try_into()?,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let output_host_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("ansi_output_host"),
-            size: max_output_size_bytes.try_into()?,
+            size: rounded_max_output_size_bytes.try_into()?,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

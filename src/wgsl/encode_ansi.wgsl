@@ -81,6 +81,10 @@ fn append_rgba(appender: ptr<function, Appender>,
 @compute @workgroup_size(16, 16, 1)
 fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
+    if (id.x >= tex_dims.x || id.y * 2 >= tex_dims.y) {
+        return;
+    }
+
     let idx = id.y * tex_dims.x + id.x;
     var cursor = offsets[idx];
 
