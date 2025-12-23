@@ -79,7 +79,7 @@ fn append_rgba(appender: ptr<function, Appender>,
     append(appender, ASCII_LOWERCASE_M);
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(16, 16, 1)
 fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
     let idx = id.y * tex_dims.x + id.x;
@@ -91,7 +91,7 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     // Convert dest_off to multiple of u32s, rounding up. Skipped part is
     // written by previous thread.
     appender.dest_off = (cursor + 3) / 4;
-    let skip = appender.dest_off - cursor;
+    let skip = (appender.dest_off * 4 - cursor) % 4;
 
     let pix_top = textureLoad(input, vec2(id.x, id.y * 2), 0);
     append_rgba(&appender, pix_top, true, skip);

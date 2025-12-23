@@ -11,6 +11,10 @@ fn get_digits_len(val: u32) -> u32 {
 @compute @workgroup_size(16, 16, 1)
 fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
+    
+    if (id.x >= tex_dims.x || id.y >= tex_dims.y) {
+        return;
+    }
 
     let pos_out = id.xy;
     let pos_top = vec2(id.x, id.y * 2);
