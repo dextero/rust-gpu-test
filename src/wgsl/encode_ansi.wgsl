@@ -7,6 +7,7 @@ const ASCII_LEFT_BRACKET: u32 = 0x5b;
 const ASCII_ZERO: u32 = 0x30;
 const ASCII_SEMICOLON: u32 = 0x3b;
 const ASCII_LOWERCASE_M: u32 = 0x6d;
+const ASCII_NEWLINE: u32 = 0x0a;
 const UTF8_UPPER_HALF_BLOCK: array<u32, 3> = array<u32, 3>(0xe2, 0x96, 0x80);
 
 struct Appender {
@@ -81,7 +82,9 @@ fn append_rgba(appender: ptr<function, Appender>,
 @compute @workgroup_size(16, 16, 1)
 fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
-    if (id.x >= tex_dims.x || id.y * 2 >= tex_dims.y) {
+    let pos_top = vec2(id.x, id.y * 2);
+    let pos_bot = vec2(id.x, id.y * 2 + 1);
+    if (pos_top.x >= tex_dims.x || pos_top.y >= tex_dims.y) {
         return;
     }
 
@@ -96,14 +99,17 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     appender.dest_off = (cursor + 3) / 4;
     let skip = appender.dest_off * 4 - cursor;
 
-    let pix_top = textureLoad(input, vec2(id.x, id.y * 2), 0);
+    let pix_top = textureLoad(input, pos_top, 0);
     append_rgba(&appender, pix_top, true, skip);
-    if (id.y * 2 + 1 < tex_dims.y) {
-        let pix_bot = textureLoad(input, vec2(id.x, id.y * 2 + 1), 0);
+    if (pos_bot.y < tex_dims.y) {
+        let pix_bot = textureLoad(input, pos_bot, 0);
         append_rgba(&appender, pix_bot, false, /*skip=*/0);
     }
     append(&appender, UTF8_UPPER_HALF_BLOCK[0]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[1]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[2]);
+    if (id.x == tex_dims.x - 1) {
+        append(&appender, ASCII_NEWLINE);
+    }
     pad(&appender);
 }

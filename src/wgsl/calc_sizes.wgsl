@@ -11,12 +11,13 @@ fn get_digits_len(val: u32) -> u32 {
 @compute @workgroup_size(16, 16, 1)
 fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
-    if (id.x >= tex_dims.x || id.y >= tex_dims.y) {
+    let pos_top = vec2(id.x, id.y * 2);
+    let pos_bot = vec2(id.x, id.y * 2 + 1);
+
+    if (pos_top.x >= tex_dims.x || pos_top.y >= tex_dims.y) {
         return;
     }
 
-    let pos_out = id.xy;
-    let pos_top = vec2(id.x, id.y * 2);
     let top = textureLoad(input, pos_top, 0);
 
     // \x1b[38;RRR;GGG;BBBm
@@ -33,16 +34,15 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     var len = 11u; // 8 fixed + 3 for upper half block
     len += get_digits_len(top.r) + get_digits_len(top.g) + get_digits_len(top.b);
     // Only add the second escape if there is an odd row
-    if (id.y * 2 + 1 < tex_dims.y) {
-        let pos_bot = vec2(id.x, id.y * 2 + 1);
+    if (pos_bot.y < tex_dims.y) {
         let bot = textureLoad(input, pos_bot, 0);
         len += 8u; // 8 fixed
         len += get_digits_len(bot.r) + get_digits_len(bot.g) + get_digits_len(bot.b);
     }
     
     // Add newline if at the end of a row
-    if (pos_out.x == tex_dims.x - 1) { len += 1u; } // "\n"
+    if (id.x == tex_dims.x - 1) { len += 1u; } // "\n"
 
-    let out_idx = pos_out.y * tex_dims.x + pos_out.x;
+    let out_idx = id.y * tex_dims.x + id.x;
     sizes[out_idx] = len;
 }
