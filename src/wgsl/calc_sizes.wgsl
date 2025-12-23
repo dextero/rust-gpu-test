@@ -8,7 +8,7 @@ fn get_digits_len(val: u32) -> u32 {
     return len;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(16, 16, 1)
 fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
 

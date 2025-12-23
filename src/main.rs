@@ -204,15 +204,16 @@ impl GpuAnsiEncoder {
         size_rx.await??;
         output_rx.await??;
 
-        let size: u64 = u32::from_le_bytes(
+        let size: usize = u32::from_le_bytes(
             total_size_host_buffer
                 .get_mapped_range(..)
                 .iter()
                 .as_slice()
                 .try_into()?,
-        ).into();
+        ).try_into()?;
         eprintln!("size = {} ({:#x})", size, size);
-        let bytes = output_host_buffer.get_mapped_range(..size).to_vec();
+        let rounded_size = u64::try_from(((size + 3) / 4) * 4)?;
+        let bytes = output_host_buffer.get_mapped_range(..rounded_size)[..size].to_vec();
         let s = unsafe { String::from_utf8_unchecked(bytes) };
         Ok(s)
     }
