@@ -18,9 +18,12 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     let top = textureLoad(input, pos_top, 0);
     let bot = textureLoad(input, pos_bot, 0);
 
-    // ANSI structure: \x1b[38;2;R;G;Bm \x1b[48;2;R;G;Bm ▀
-    // Base chars: "\x1b[38;2;;;m\x1b[48;2;;;m▀" = 22 fixed characters
-    var len = 22u;
+    // \x1b[38;RRR;GGG;BBBm\x1b[48;RRR;GGG;BBBm\xe2\x96\x80
+    //         ^^^ ^^^ ^^^         ^^^ ^^^ ^^^
+    //          '---'---'-----------'---'---'-------------- 1-3 * 6
+    // ^~~~^^^^   ^   ^   ^^~~~^^^^   ^   ^   ^^~~~^~~~^~~~ 19 fixed chars
+    //                                                     \n if at EOL
+    var len = 19u;
     len += get_digits_len(top.r) + get_digits_len(top.g) + get_digits_len(top.b);
     len += get_digits_len(bot.r) + get_digits_len(bot.g) + get_digits_len(bot.b);
     

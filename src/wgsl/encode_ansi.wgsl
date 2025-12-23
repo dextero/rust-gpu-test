@@ -11,17 +11,22 @@ const UTF8_UPPER_HALF_BLOCK: array<u32, 3> = array<u32, 3>(0xe2, 0x96, 0x80);
 
 struct Appender {
     acc: u32,
-    acc_mask: u32,
     acc_shift: u32,
     dest_off: u32,
 }
 
+fn pad(appender: ptr<function, Appender>) -> u32 {
+    const padding: array<u32, 3> = array<u32, 3>(ANSI_ESCAPE, ASCII_LEFT_BRACKET, ASCII_ZERO + 3);
+    let padding_needed = (4 - appender.acc_shift / 8) % 4;
+    for (var i = 0u; i < padding_needed; i += 1) {
+        append(appender, padding[i]);
+    }
+    return padding_needed;
+}
+
 fn flush(appender: ptr<function, Appender>) {
-    let old_val = output[appender.dest_off] & ~appender.acc_mask;
-    let new_val = appender.acc & appender.acc_mask;
-    output[appender.dest_off] = old_val | new_val;
+    output[appender.dest_off] = appender.acc;
     appender.acc = 0;
-    appender.acc_mask = 0;
     appender.acc_shift = 0;
     appender.dest_off += 1;
 }
@@ -30,7 +35,6 @@ fn append(appender: ptr<function, Appender>,
           byte: u32) {
     appender.acc |= (byte & 0xFF) << appender.acc_shift;
     appender.acc_shift += 8;
-    appender.acc_mask = (appender.acc_mask << 8) | 0xFF;
     if (appender.acc_shift >= 32) {
         flush(appender);
     }
@@ -52,15 +56,18 @@ fn append_u8_str(appender: ptr<function, Appender>,
 
 fn append_rgba(appender: ptr<function, Appender>,
                pixel: vec4<u32>,
-               foreground: bool) {
-    append(appender, ANSI_ESCAPE);
-    append(appender, ASCII_LEFT_BRACKET);
-    if (foreground) {
-        append(appender, ASCII_ZERO + 3);
-    } else {
-        append(appender, ASCII_ZERO + 4);
+               foreground: bool,
+               skip: u32) {
+    if (skip <= 0) { append(appender, ANSI_ESCAPE); }
+    if (skip <= 1) { append(appender, ASCII_LEFT_BRACKET); }
+    if (skip <= 2) {
+        if (foreground) {
+            append(appender, ASCII_ZERO + 3);
+        } else {
+            append(appender, ASCII_ZERO + 4);
+        }
     }
-    append(appender, ASCII_ZERO + 8);
+    if (skip <= 3) { append(appender, ASCII_ZERO + 8); }
     append(appender, ASCII_SEMICOLON);
     append(appender, ASCII_ZERO + 2);
     append(appender, ASCII_SEMICOLON);
@@ -80,15 +87,22 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var appender = Appender();
     appender.acc = 0;
-    appender.acc_mask = 0;
-    appender.acc_shift = cursor % 4;
-    appender.dest_off = cursor / 4;
+    appender.acc_shift = 0;
+    // Convert dest_off to multiple of u32s, rounding up. Skipped part is
+    // written by previous thread.
+    appender.dest_off = (cursor + 3) / 4;
+    let skip = appender.dest_off - cursor;
 
-    let pix = textureLoad(input, vec2(0, 0), 0);
-    append_rgba(&appender, pix, true);
-    append_rgba(&appender, pix, false);
+    let pix_top = textureLoad(input, vec2(id.x, id.y * 2), 0);
+    append_rgba(&appender, pix_top, true, skip);
+    if (id.y * 2 + 1 < tex_dims.y) {
+        let pix_bot = textureLoad(input, vec2(id.x, id.y * 2 + 1), 0);
+        append_rgba(&appender, pix_bot, false, /*skip=*/0);
+    }
     append(&appender, UTF8_UPPER_HALF_BLOCK[0]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[1]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[2]);
-    flush(&appender);
+    if (pad(&appender) > 0) {
+        flush(&appender);
+    }
 }
