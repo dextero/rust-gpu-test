@@ -94,7 +94,7 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     // Convert dest_off to multiple of u32s, rounding up. Skipped part is
     // written by previous thread.
     appender.dest_off = (cursor + 3) / 4;
-    let skip = (appender.dest_off * 4 - cursor) % 4;
+    let skip = appender.dest_off * 4 - cursor;
 
     let pix_top = textureLoad(input, vec2(id.x, id.y * 2), 0);
     append_rgba(&appender, pix_top, true, skip);
