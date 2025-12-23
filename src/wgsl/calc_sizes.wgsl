@@ -14,9 +14,7 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let pos_out = id.xy;
     let pos_top = vec2(id.x, id.y * 2);
-    let pos_bot = vec2(id.x, id.y * 2 + 1);
     let top = textureLoad(input, pos_top, 0);
-    let bot = textureLoad(input, pos_bot, 0);
 
     // \x1b[38;RRR;GGG;BBBm\x1b[48;RRR;GGG;BBBm\xe2\x96\x80
     //         ^^^ ^^^ ^^^         ^^^ ^^^ ^^^
@@ -25,7 +23,12 @@ fn calc_sizes(@builtin(global_invocation_id) id: vec3<u32>) {
     //                                                     \n if at EOL
     var len = 19u;
     len += get_digits_len(top.r) + get_digits_len(top.g) + get_digits_len(top.b);
-    len += get_digits_len(bot.r) + get_digits_len(bot.g) + get_digits_len(bot.b);
+    // Only add the second escape if there is an odd row
+    if (id.y * 2 + 1 < tex_dims.y) {
+        let pos_bot = vec2(id.x, id.y * 2 + 1);
+        let bot = textureLoad(input, pos_bot, 0);
+        len += get_digits_len(bot.r) + get_digits_len(bot.g) + get_digits_len(bot.b);
+    }
     
     // Add newline if at the end of a row
     if (pos_out.x == tex_dims.x - 1) { len += 1u; } // "\n"
