@@ -433,4 +433,33 @@ mod tests {
         assert_eq!(result_1x1, vec![24]);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_calc_sizes_multiple_of_4() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+
+        let pixels_2x4: Vec<u8> = vec![
+            255, 0, 0, 255, // (0, 0)
+            0, 255, 0, 255, // (0, 1)
+            0, 0, 11, 255,  // (1, 0)
+            1, 0, 0, 255,   // (1, 1)
+            255, 0, 0, 255, // (0, 2)
+            0, 255, 0, 255, // (0, 3)
+            0, 0, 11, 255,  // (1, 2)
+            1, 0, 0, 255,   // (1, 3)
+        ];
+        let size_2x4 = (2, 4);
+        let result_2x4 =
+            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x4, size_2x4)
+                .await?;
+        // Expected values calculated manually based on shader logic.
+        // id(0,0): top(255,0,0), bot(0,0,11). len = 13 + (3+1+1) + 10 + (1+1+2) = 32
+        // id(1,0): top(0,0,255), bot(1,0,0). len = 13 + (1+1+3) + 10 + (1+1+1) + 5 (eol) = 36
+        // id(0,1): top(255,0,0), bot(0,0,11). len = 13 + (3+1+1) + 10 + (1+1+2) = 32
+        // id(1,1): top(0,0,255), bot(1,0,0). len = 13 + (1+1+3) + 10 + (1+1+1) + 5 (eol) = 36
+        assert_eq!(result_2x4, vec![32, 36, 32, 36]);
+        Ok(())
+    }
+
 }
