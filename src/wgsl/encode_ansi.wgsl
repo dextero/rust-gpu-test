@@ -45,10 +45,10 @@ fn append_u8_str(appender: ptr<function, Appender>,
     let ones = value % 10;
     let tens = (value % 100) / 10;
     let hundreds = (value % 1000) / 100;
-    if (hundreds > 0) {
+    if (value > 99) {
         append(appender, ASCII_ZERO + hundreds);
     }
-    if (tens > 0) {
+    if (value > 9) {
         append(appender, ASCII_ZERO + tens);
     }
     append(appender, ASCII_ZERO + ones);

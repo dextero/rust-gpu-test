@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
             view_formats: &[TextureFormat::Rgba8Uint],
         },
         wgpu::wgt::TextureDataOrder::LayerMajor,
-        &dbg!(pixels),
+        &pixels,
     );
 
     let ansi_encoder = GpuAnsiEncoder::new(device, queue).await?;
@@ -662,63 +662,15 @@ mod tests {
         Ok(())
     }
 
-    const NULLBYTES_BUG_PIXELS: [u8; 4 * 11 * 3] = [
-        255, 0, 0, 255, // 3+1+1 = 5
-        255, 69, 0, 255, // 3+2+1 = 6
-        255, 139, 0, 255, // 3+3+1 = 7
-        255, 208, 0, 255, // 3+3+1 = 7
-        231, 255, 0, 255, // 3+3+1 = 7
-        162, 255, 0, 255, // 3+3+1 = 7
-        92, 255, 0, 255, // 2+3+1 = 6
-        23, 255, 0, 255, // 2+3+1 = 6
-        0, 255, 46, 255, // 1+3+2 = 6
-        0, 255, 115, 255, // 1+3+3 = 7
-        0, 255, 185, 255, // 1+3+3 = 7
-        255, 69, 0, 255, // 3+2+1 = 6+5 = 11+23 = 34
-        255, 139, 0, 255, // 3+3+1 = 7+6 = 13+23 = 36
-        255, 208, 0, 255, // 3+3+1 = 7+7 = 14+23 = 37
-        231, 255, 0, 255, // 3+3+1 = 7+7 = 14+23 = 37
-        162, 255, 0, 255, // 3+3+1 = 7+7 = 14+23 = 37
-        92, 255, 0, 255, // 2+3+1 = 6+7 = 13+23 = 36
-        23, 255, 0, 255, // 2+3+1 = 6+6 = 12+23 = 35
-        0, 255, 46, 255, // 1+3+2 = 6+6 = 12+23 = 35
-        0, 255, 115, 255, // 1+3+3 = 7+6 = 13+23 = 36
-        0, 255, 185, 255, // 1+3+3 = 7+7 = 14+23 = 37
-        0, 255, 255, 255, // 1+3+3 = 7+7 = 14+28 = 42
-        255, 139, 0, 255, // 3+3+1 = 7+13 = 20
-        255, 208, 0, 255, // 3+3+1 = 7+13 = 20
-        231, 255, 0, 255, // 3+3+1 = 7+13 = 20
-        162, 255, 0, 255, // 3+3+1 = 7+13 = 20
-        92, 255, 0, 255, // 2+3+1 = 6+13 = 19
-        23, 255, 0, 255, // 2+3+1 = 6+13 = 19
-        0, 255, 46, 255, // 1+3+2 = 6+13 = 19
-        0, 255, 115, 255, // 1+3+3 = 7+13 = 20
-        0, 255, 185, 255, // 1+3+3 = 7+13 = 20
-        0, 255, 255, 255, // 1+3+3 = 7+13 = 20
-        0, 185, 255, 255, // 1+3+3 = 7+18 = 25
-    ];
-    const NULLBYTES_BUG_SIZE: (u32, u32) = (11, 3);
-
     #[tokio::test]
-    async fn test_calc_sizes_nullbytes_bug() -> Result<()> {
+    async fn test_encode_ascii_zero_in_the_middle() -> Result<()> {
         assert_debug_snapshot!(
-            run_calc_sizes_test(&NULLBYTES_BUG_PIXELS, NULLBYTES_BUG_SIZE).await?
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_prefix_sum_nullbytes_bug() -> Result<()> {
-        let sizes = run_calc_sizes_test(&NULLBYTES_BUG_PIXELS, NULLBYTES_BUG_SIZE).await?;
-        assert_debug_snapshot!(run_prefix_sum_test(&sizes).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_encode_ascii_nullbytes_bug() -> Result<()> {
-        let sizes = run_calc_sizes_test(&NULLBYTES_BUG_PIXELS, NULLBYTES_BUG_SIZE).await?;
-        assert_debug_snapshot!(
-            run_encode_ansi_test(&NULLBYTES_BUG_PIXELS, NULLBYTES_BUG_SIZE, &sizes).await?
+            run_encode_ansi_test(&[
+                200, 200, 200, 255, //
+                200, 200, 200, 255, //
+                200, 200, 200, 255, //
+                200, 200, 200, 255, //
+            ], (2, 2), &[41, 46]).await?
         );
         Ok(())
     }
