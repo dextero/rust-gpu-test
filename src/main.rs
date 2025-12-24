@@ -363,7 +363,7 @@ mod tests {
         device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
-        });
+        })?;
 
         rx.await??;
 
