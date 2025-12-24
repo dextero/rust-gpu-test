@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::{borrow::Cow, rc::Rc};
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, BindingResource, BufferDescriptor, BufferUsages,
-    CommandEncoder, ComputePipeline, Device, MapMode, Queue, ShaderModuleDescriptor,
-    ShaderSource, Texture, TextureFormat, TextureUsages, util::DeviceExt, wgt::TextureDescriptor,
+    CommandEncoder, ComputePipeline, Device, MapMode, Queue, ShaderModuleDescriptor, ShaderSource,
+    Texture, TextureFormat, TextureUsages, util::DeviceExt, wgt::TextureDescriptor,
 };
 
 struct GpuFuncInvoker {
@@ -59,7 +59,13 @@ impl GpuFuncInvoker {
 }
 
 macro_rules! static_func_invoker {
-    ($device:expr, $src:literal) => {{ GpuFuncInvoker::from_source($device, $src, Cow::Borrowed(include_str!($src))) }};
+    ($device:expr, $src:literal) => {{
+        GpuFuncInvoker::from_source(
+            $device,
+            $src,
+            std::borrow::Cow::Borrowed(include_str!($src)),
+        )
+    }};
 }
 
 struct GpuAnsiEncoder {
@@ -264,4 +270,169 @@ async fn main() -> Result<()> {
     println!("{s}\x1b[0m");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use std::rc::Rc;
+    use wgpu::{
+        BindingResource, BufferDescriptor, BufferUsages, Device, MapMode, Queue, TextureDescriptor,
+        TextureFormat, TextureUsages, util::DeviceExt,
+    };
+
+    use crate::GpuFuncInvoker;
+
+    async fn get_device() -> Result<(Rc<Device>, Rc<Queue>)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await?;
+        Ok((Rc::new(device), Rc::new(queue)))
+    }
+
+    async fn run_calc_sizes_test(
+        device: &Device,
+        queue: &Queue,
+        invoker: &GpuFuncInvoker,
+        pixels: &[u8],
+        texture_size: (u32, u32),
+    ) -> Result<Vec<u32>> {
+        let texture = device.create_texture_with_data(
+            queue,
+            &TextureDescriptor {
+                label: Some("test_texture"),
+                size: wgpu::Extent3d {
+                    width: texture_size.0,
+                    height: texture_size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TextureFormat::Rgba8Uint,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[TextureFormat::Rgba8Uint],
+            },
+            wgpu::wgt::TextureDataOrder::LayerMajor,
+            pixels,
+        );
+
+        let num_outputs = texture_size.0 * ((texture_size.1 + 1) / 2);
+        let sizes_buffer_size = (num_outputs * std::mem::size_of::<u32>() as u32) as u64;
+
+        let sizes_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("sizes_buffer"),
+            size: sizes_buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("staging_buffer"),
+            size: sizes_buffer_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_encoder"),
+        });
+
+        let texture_view = texture.create_view(&Default::default());
+        invoker.invoke(
+            &mut encoder,
+            [
+                BindingResource::TextureView(&texture_view),
+                sizes_buffer.as_entire_binding(),
+            ],
+            (texture_size.0, (texture_size.1 + 1) / 2),
+        );
+
+        encoder.copy_buffer_to_buffer(&sizes_buffer, 0, &staging_buffer, 0, sizes_buffer_size);
+
+        let submission_index = queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        buffer_slice.map_async(MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+
+        device.poll(wgpu::wgt::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        });
+
+        rx.await??;
+
+        let data = buffer_slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn test_calc_sizes_even_width_height() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+
+        let pixels_2x2: Vec<u8> = vec![
+            255, 0, 0, 255, // Top-left: Red (255,0,0)
+            0, 0, 255, 255, // Top-right: Blue (0,0,255)
+            0, 255, 0, 255, // Bottom-left: Green (0,255,0)
+            255, 255, 255, 255, // Bottom-right: White (255,255,255)
+        ];
+        let size_2x2 = (2, 2);
+        let result_2x2 =
+            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x2, size_2x2)
+                .await?;
+        // Expected values calculated manually based on shader logic.
+        // id(0,0): top(255,0,0), bot(0,255,0). len = 13 + (3+1+1) + 10 + (1+3+1) = 33
+        // id(1,0): top(0,0,255), bot(255,255,255). len = 13 + (1+1+3) + 10 + (3+3+3) + 5 (eol) = 42
+        assert_eq!(result_2x2, vec![33, 42]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_calc_sizes_even_width_odd_height() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+
+        let pixels_2x1: Vec<u8> = vec![
+            255, 0, 0, 255, // Top-left: Red (255,0,0)
+            0, 0, 255, 255, // Top-right: Blue (0,0,255)
+        ];
+        let size_2x1 = (2, 1);
+        let result_2x1 =
+            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x1, size_2x1)
+                .await?;
+        // Expected values:
+        // id(0,0): top(255,0,0), no bot. len = 13 + (3+1+1) = 18
+        // id(1,0): top(0,0,255), no bot. len = 13 + (1+1+3) + 5 (eol) = 23
+        assert_eq!(result_2x1, vec![18, 23]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_calc_sizes_odd_width_height() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+
+        let pixels_1x1: Vec<u8> = vec![
+            10, 20, 30, 255, // (10,20,30)
+        ];
+        let size_1x1 = (1, 1);
+        let result_1x1 =
+            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_1x1, size_1x1)
+                .await?;
+
+        // Expected values:
+        // id(0,0): top(10,20,30), no bot. len = 13 + (2+2+2) + 5 (eol) = 24
+        assert_eq!(result_1x1, vec![24]);
+        Ok(())
+    }
 }
