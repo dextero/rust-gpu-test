@@ -114,10 +114,8 @@ impl GpuAnsiEncoder {
             mapped_at_creation: false,
         });
         let max_output_size_bytes: usize = usize::try_from(num_pixels)?
-            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}"
-                .as_bytes()
-                .len();
-        let rounded_max_output_size_bytes = (max_output_size_bytes + 3) / 4 * 4;
+            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len();
+        let rounded_max_output_size_bytes = max_output_size_bytes.div_ceil(4) * 4;
         let output_device_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("ansi_output_device"),
             size: rounded_max_output_size_bytes.try_into()?,
@@ -144,7 +142,7 @@ impl GpuAnsiEncoder {
                 BindingResource::TextureView(&texture_view),
                 offsets_buffer.as_entire_binding(),
             ],
-            (texture.size().width, (texture.size().height + 1) / 2),
+            (texture.size().width, texture.size().height.div_ceil(2)),
         );
         self.prefix_sum_invoker.invoke(
             &mut encoder,
@@ -161,7 +159,7 @@ impl GpuAnsiEncoder {
                 offsets_buffer.as_entire_binding(),
                 output_device_buffer.as_entire_binding(),
             ],
-            (texture.size().width, (texture.size().height + 1) / 2),
+            (texture.size().width, texture.size().height.div_ceil(2)),
         );
 
         encoder.copy_buffer_to_buffer(
@@ -206,7 +204,7 @@ impl GpuAnsiEncoder {
         )
         .try_into()?;
         eprintln!("size = {} ({:#x})", size, size);
-        let rounded_size = u64::try_from(((size + 3) / 4) * 4)?;
+        let rounded_size = u64::try_from(size.div_ceil(4) * 4)?;
         let bytes = output_host_buffer.get_mapped_range(..rounded_size)[..size].to_vec();
         let s = unsafe { String::from_utf8_unchecked(bytes) };
         Ok(s)
@@ -224,7 +222,7 @@ fn gen_pixels(width: usize, height: usize) -> Vec<u8> {
     (0..height)
         .flat_map(|n| {
             let off = n % width;
-            row[off..off + width].into_iter()
+            row[off..off + width].iter()
         })
         .flatten()
         .copied()
