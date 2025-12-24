@@ -615,4 +615,114 @@ mod tests {
 
         Ok(())
     }
+
+    async fn run_prefix_sum_test(
+        device: &Device,
+        queue: &Queue,
+        invoker: &GpuFuncInvoker,
+        sizes: &[u32],
+    ) -> Result<(Vec<u32>, u32)> {
+        let sizes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sizes_buffer"),
+            contents: bytemuck::cast_slice(sizes),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+
+        let total_size_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("total_size_buffer"),
+            size: std::mem::size_of::<u32>() as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let sizes_staging_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("sizes_staging_buffer"),
+            size: sizes_buffer.size(),
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let total_size_staging_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("total_size_staging_buffer"),
+            size: total_size_buffer.size(),
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_encoder"),
+        });
+
+        invoker.invoke(
+            &mut encoder,
+            [
+                sizes_buffer.as_entire_binding(),
+                total_size_buffer.as_entire_binding(),
+            ],
+            (1, 1),
+        );
+
+        encoder.copy_buffer_to_buffer(
+            &sizes_buffer,
+            0,
+            &sizes_staging_buffer,
+            0,
+            sizes_buffer.size(),
+        );
+        encoder.copy_buffer_to_buffer(
+            &total_size_buffer,
+            0,
+            &total_size_staging_buffer,
+            0,
+            total_size_buffer.size(),
+        );
+
+        let submission_index = queue.submit(Some(encoder.finish()));
+
+        let sizes_slice = sizes_staging_buffer.slice(..);
+        let (sizes_tx, sizes_rx) = tokio::sync::oneshot::channel();
+        sizes_slice.map_async(MapMode::Read, move |result| {
+            sizes_tx.send(result).unwrap();
+        });
+
+        let total_size_slice = total_size_staging_buffer.slice(..);
+        let (total_size_tx, total_size_rx) = tokio::sync::oneshot::channel();
+        total_size_slice.map_async(MapMode::Read, move |result| {
+            total_size_tx.send(result).unwrap();
+        });
+
+        device.poll(wgpu::wgt::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        })?;
+
+        sizes_rx.await??;
+        total_size_rx.await??;
+
+        let sizes_data = sizes_slice.get_mapped_range();
+        let offsets: Vec<u32> = bytemuck::cast_slice(&sizes_data).to_vec();
+
+        let total_size_data = total_size_slice.get_mapped_range();
+        let total_size: u32 = bytemuck::cast_slice(&total_size_data)[0];
+
+        Ok((offsets, total_size))
+    }
+
+    #[tokio::test]
+    async fn test_prefix_sum() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let prefix_sum_invoker = static_func_invoker!(device.clone(), "wgsl/prefix_sum.wgsl");
+
+        let sizes = vec![10, 20, 5, 30, 15];
+        let (offsets, total_size) =
+            run_prefix_sum_test(&device, &queue, &prefix_sum_invoker, &sizes).await?;
+
+        let expected_offsets = vec![0, 10, 30, 35, 65];
+        let expected_total_size = 80;
+
+        assert_eq!(offsets, expected_offsets);
+        assert_eq!(total_size, expected_total_size);
+
+        Ok(())
+    }
 }
