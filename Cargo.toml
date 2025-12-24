@@ -9,3 +9,6 @@ bytemuck = "1.24.0"
 hsv = "0.1.1"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync"] }
 wgpu = "27.0.1"
+
+[dev-dependencies]
+insta = { version = "1.45.0", features = ["json"] }

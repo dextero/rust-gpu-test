@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use insta::assert_debug_snapshot;
     use std::rc::Rc;
     use wgpu::{
         BindingResource, BufferDescriptor, BufferUsages, Device, MapMode, Queue, TextureDescriptor,
@@ -281,7 +282,7 @@ mod tests {
 
     use crate::GpuFuncInvoker;
 
-    async fn get_device() -> Result<(Rc<Device>, Rc<Queue>)> {
+    async fn get_device() -> Result<(Rc<Device>, Queue)> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -289,18 +290,15 @@ mod tests {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await?;
-        Ok((Rc::new(device), Rc::new(queue)))
+        Ok((Rc::new(device), queue))
     }
 
-    async fn run_calc_sizes_test(
-        device: &Device,
-        queue: &Queue,
-        invoker: &GpuFuncInvoker,
-        pixels: &[u8],
-        texture_size: (u32, u32),
-    ) -> Result<Vec<u32>> {
+    async fn run_calc_sizes_test(pixels: &[u8], texture_size: (u32, u32)) -> Result<Vec<u32>> {
+        let (device, queue) = get_device().await?;
+        let invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+
         let texture = device.create_texture_with_data(
-            queue,
+            &queue,
             &TextureDescriptor {
                 label: Some("test_texture"),
                 size: wgpu::Extent3d {
@@ -375,253 +373,70 @@ mod tests {
 
     #[tokio::test]
     async fn test_calc_sizes_even_width_height() -> Result<()> {
-        let (device, queue) = get_device().await?;
-        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
-
-        let pixels_2x2: Vec<u8> = vec![
-            255, 0, 0, 255, // Top-left: Red (255,0,0)
-            0, 0, 255, 255, // Top-right: Blue (0,0,255)
-            0, 255, 0, 255, // Bottom-left: Green (0,255,0)
-            255, 255, 255, 255, // Bottom-right: White (255,255,255)
-        ];
-        let size_2x2 = (2, 2);
-        let result_2x2 =
-            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x2, size_2x2)
-                .await?;
-        // Expected values calculated manually based on shader logic.
-        // id(0,0): top(255,0,0), bot(0,255,0). len = 13 + (3+1+1) + 10 + (1+3+1) = 33
-        // id(1,0): top(0,0,255), bot(255,255,255). len = 13 + (1+1+3) + 10 + (3+3+3) + 5 (eol) = 42
-        assert_eq!(result_2x2, vec![33, 42]);
+        assert_debug_snapshot!(
+            run_calc_sizes_test(
+                &[
+                    255, 0, 0, 255, // "\x1b[38;2;255;0;0m"     - seq 0, 10+3+1+1=15
+                    0, 0, 255, 255, // "\x1b[38;2;0;0;255m"     - seq 1, 10+1+1+3=15
+                    0, 255, 0, 255, // "\x1b[48;2;0;255;0"      - seq 0, 10+1+3+1=15
+                    255, 255, 255, 255, // "\x1b[48;2;255;255;255m" - seq 1, 10+3+3+3=19
+                ],
+                // +3 per UTF-8 character; +5 per "\x1b[0m\n" @ EOL
+                (2, 2)
+            )
+            .await?
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_calc_sizes_even_width_odd_height() -> Result<()> {
-        let (device, queue) = get_device().await?;
-        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
-
-        let pixels_2x1: Vec<u8> = vec![
-            255, 0, 0, 255, // Top-left: Red (255,0,0)
-            0, 0, 255, 255, // Top-right: Blue (0,0,255)
-        ];
-        let size_2x1 = (2, 1);
-        let result_2x1 =
-            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x1, size_2x1)
-                .await?;
-        // Expected values:
-        // id(0,0): top(255,0,0), no bot. len = 13 + (3+1+1) = 18
-        // id(1,0): top(0,0,255), no bot. len = 13 + (1+1+3) + 5 (eol) = 23
-        assert_eq!(result_2x1, vec![18, 23]);
+        assert_debug_snapshot!(
+            run_calc_sizes_test(
+                &[
+                    255, 0, 0, 255, // "\x1b[38;2;255;0;0m"   - seq 0, 10+3+1+1=15
+                    0, 255, 0, 255, // "\x1b[48;2;255;0;255m" - seq 1, 10+3+1+3=17
+                ],
+                // +3 per UTF-8 character; +5 per "\x1b[0m\n" @ EOL
+                (2, 1)
+            )
+            .await?
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_calc_sizes_odd_width_height() -> Result<()> {
-        let (device, queue) = get_device().await?;
-        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
-
-        let pixels_1x1: Vec<u8> = vec![
-            10, 20, 30, 255, // (10,20,30)
-        ];
-        let size_1x1 = (1, 1);
-        let result_1x1 =
-            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_1x1, size_1x1)
-                .await?;
-
-        // Expected values:
-        // id(0,0): top(10,20,30), no bot. len = 13 + (2+2+2) + 5 (eol) = 24
-        assert_eq!(result_1x1, vec![24]);
+        // "\x1b[38;2;10;20;30m\xe2\x96\x80\x1b[0m\n" = 10+2+2+2+3+5=24
+        assert_debug_snapshot!(run_calc_sizes_test(&[10, 20, 30, 255], (1, 1)).await?);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_calc_sizes_multiple_of_4() -> Result<()> {
-        let (device, queue) = get_device().await?;
-        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
-
-        let pixels_2x4: Vec<u8> = vec![
-            255, 0, 0, 255, // (0, 0)
-            0, 255, 0, 255, // (0, 1)
-            0, 0, 11, 255,  // (1, 0)
-            1, 0, 0, 255,   // (1, 1)
-            255, 0, 0, 255, // (0, 2)
-            0, 255, 0, 255, // (0, 3)
-            0, 0, 11, 255,  // (1, 2)
-            1, 0, 0, 255,   // (1, 3)
-        ];
-        let size_2x4 = (2, 4);
-        let result_2x4 =
-            run_calc_sizes_test(&device, &queue, &calc_sizes_invoker, &pixels_2x4, size_2x4)
-                .await?;
-        // Expected values calculated manually based on shader logic.
-        // id(0,0): top(255,0,0), bot(0,0,11). len = 13 + (3+1+1) + 10 + (1+1+2) = 32
-        // id(1,0): top(0,0,255), bot(1,0,0). len = 13 + (1+1+3) + 10 + (1+1+1) + 5 (eol) = 36
-        // id(0,1): top(255,0,0), bot(0,0,11). len = 13 + (3+1+1) + 10 + (1+1+2) = 32
-        // id(1,1): top(0,0,255), bot(1,0,0). len = 13 + (1+1+3) + 10 + (1+1+1) + 5 (eol) = 36
-        assert_eq!(result_2x4, vec![32, 36, 32, 36]);
+        assert_debug_snapshot!(
+            run_calc_sizes_test(
+                &[
+                    255, 0, 0, 255, // (0, 0)
+                    0, 255, 0, 255, // (0, 1)
+                    0, 0, 11, 255, // (1, 0)
+                    1, 0, 0, 255, // (1, 1)
+                    255, 0, 0, 255, // (0, 2)
+                    0, 255, 0, 255, // (0, 3)
+                    0, 0, 11, 255, // (1, 2)
+                    1, 0, 0, 255, // (1, 3)
+                ],
+                (2, 4)
+            )
+            .await?
+        );
         Ok(())
     }
 
-    async fn run_encode_ansi_test(
-        device: &Device,
-        queue: &Queue,
-        invoker: &GpuFuncInvoker,
-        pixels: &[u8],
-        texture_size: (u32, u32),
-        sizes: &[u32],
-    ) -> Result<String> {
-        let mut offsets = Vec::with_capacity(sizes.len());
-        let mut current_offset = 0;
-        for size in sizes {
-            offsets.push(current_offset);
-            current_offset += *size;
-        }
-        let total_size = current_offset;
-
-        let texture = device.create_texture_with_data(
-            queue,
-            &TextureDescriptor {
-                label: Some("test_texture"),
-                size: wgpu::Extent3d {
-                    width: texture_size.0,
-                    height: texture_size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: TextureFormat::Rgba8Uint,
-                usage: TextureUsages::TEXTURE_BINDING,
-                view_formats: &[TextureFormat::Rgba8Uint],
-            },
-            wgpu::wgt::TextureDataOrder::LayerMajor,
-            pixels,
-        );
-
-        let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("offsets_buffer"),
-            contents: bytemuck::cast_slice(&offsets),
-            usage: BufferUsages::STORAGE,
-        });
-
-        let output_buffer_size = (total_size as u64).div_ceil(4) * 4;
-        let output_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("output_buffer"),
-            size: output_buffer_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let staging_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("staging_buffer"),
-            size: output_buffer_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_encoder"),
-        });
-
-        let texture_view = texture.create_view(&Default::default());
-        invoker.invoke(
-            &mut encoder,
-            [
-                BindingResource::TextureView(&texture_view),
-                offsets_buffer.as_entire_binding(),
-                output_buffer.as_entire_binding(),
-            ],
-            (texture_size.0, (texture_size.1 + 1) / 2),
-        );
-
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
-
-        let submission_index = queue.submit(Some(encoder.finish()));
-
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        buffer_slice.map_async(MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-
-        device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })?;
-
-        rx.await??;
-
-        let data = buffer_slice.get_mapped_range();
-        let result = String::from_utf8_lossy(&data[..total_size as usize]).to_string();
-
-        Ok(result)
-    }
-
-    #[tokio::test]
-    async fn test_encode_ansi() -> Result<()> {
+    async fn run_prefix_sum_test(sizes: &[u32]) -> Result<(Vec<u32>, u32)> {
         let (device, queue) = get_device().await?;
-        let encode_ansi_invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
+        let invoker = static_func_invoker!(device.clone(), "wgsl/prefix_sum.wgsl");
 
-        let pixels: Vec<u8> = vec![
-            255, 0, 0, 255, // Top-left: Red
-            0, 0, 255, 255, // Top-right: Blue
-            0, 255, 0, 255, // Bottom-left: Green
-            255, 255, 255, 255, // Bottom-right: White
-        ];
-        let texture_size = (2, 2);
-        let sizes = &[33, 42];
-        let result =
-            run_encode_ansi_test(&device, &queue, &encode_ansi_invoker, &pixels, texture_size, sizes)
-                .await?;
-
-        let expected = "\x1b[38;2;255;0;0m\x1b[48;2;0;255;0m\u{2580}\x1b[38;2;0;0;255m\x1b[48;2;255;255;255m\u{2580}\x1b[0m\n";
-        assert_eq!(result.len(), expected.len());
-        assert_eq!(result, expected);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_encode_ansi_multiple_of_4() -> Result<()> {
-        let (device, queue) = get_device().await?;
-        let encode_ansi_invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
-
-        let pixels: Vec<u8> = vec![
-            255, 0, 0, 255, // (0, 0)
-            0, 255, 0, 255, // (1, 0)
-            0, 0, 11, 255,  // (0, 1)
-            1, 0, 0, 255,   // (1, 1)
-            255, 0, 0, 255, // (0, 2)
-            0, 255, 0, 255, // (1, 2)
-        ];
-        let texture_size = (2, 3);
-        let sizes = &[32, 36, 18, 23];
-        let result =
-            run_encode_ansi_test(&device, &queue, &encode_ansi_invoker, &pixels, texture_size, sizes)
-                .await?;
-
-        let expected = concat!(
-            "\x1b[38;2;255;0;0m",
-            "\x1b[48;2;0;0;11m\u{2580}",
-            "\x1b[38;2;0;255;0m",
-            "\x1b[48;2;1;0;0m\u{2580}",
-            "\x1b[0m\n",
-            "\x1b[38;2;255;0;0m\u{2580}",
-            "\x1b[38;2;0;255;0m\u{2580}",
-            "\x1b[0m\n",
-        );
-        assert_eq!(result.len(), expected.len());
-        assert_eq!(result, expected);
-
-        Ok(())
-    }
-
-    async fn run_prefix_sum_test(
-        device: &Device,
-        queue: &Queue,
-        invoker: &GpuFuncInvoker,
-        sizes: &[u32],
-    ) -> Result<(Vec<u32>, u32)> {
         let sizes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sizes_buffer"),
             contents: bytemuck::cast_slice(sizes),
@@ -710,19 +525,140 @@ mod tests {
 
     #[tokio::test]
     async fn test_prefix_sum() -> Result<()> {
+        assert_debug_snapshot!(run_prefix_sum_test(&[10, 20, 5, 30, 15]).await?);
+        Ok(())
+    }
+
+    async fn run_encode_ansi_test(
+        pixels: &[u8],
+        texture_size: (u32, u32),
+        sizes: &[u32],
+    ) -> Result<String> {
         let (device, queue) = get_device().await?;
-        let prefix_sum_invoker = static_func_invoker!(device.clone(), "wgsl/prefix_sum.wgsl");
+        let invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
 
-        let sizes = vec![10, 20, 5, 30, 15];
-        let (offsets, total_size) =
-            run_prefix_sum_test(&device, &queue, &prefix_sum_invoker, &sizes).await?;
+        let mut offsets = Vec::with_capacity(sizes.len());
+        let mut current_offset = 0;
+        for size in sizes {
+            offsets.push(current_offset);
+            current_offset += *size;
+        }
+        let total_size = current_offset;
 
-        let expected_offsets = vec![0, 10, 30, 35, 65];
-        let expected_total_size = 80;
+        let texture = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("test_texture"),
+                size: wgpu::Extent3d {
+                    width: texture_size.0,
+                    height: texture_size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TextureFormat::Rgba8Uint,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[TextureFormat::Rgba8Uint],
+            },
+            wgpu::wgt::TextureDataOrder::LayerMajor,
+            pixels,
+        );
 
-        assert_eq!(offsets, expected_offsets);
-        assert_eq!(total_size, expected_total_size);
+        let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("offsets_buffer"),
+            contents: bytemuck::cast_slice(&offsets),
+            usage: BufferUsages::STORAGE,
+        });
 
+        let output_buffer_size = (total_size as u64).div_ceil(4) * 4;
+        let output_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("output_buffer"),
+            size: output_buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("staging_buffer"),
+            size: output_buffer_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_encoder"),
+        });
+
+        let texture_view = texture.create_view(&Default::default());
+        invoker.invoke(
+            &mut encoder,
+            [
+                BindingResource::TextureView(&texture_view),
+                offsets_buffer.as_entire_binding(),
+                output_buffer.as_entire_binding(),
+            ],
+            (texture_size.0, (texture_size.1 + 1) / 2),
+        );
+
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
+
+        let submission_index = queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        buffer_slice.map_async(MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+
+        device.poll(wgpu::wgt::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        })?;
+
+        rx.await??;
+
+        let data = buffer_slice.get_mapped_range();
+        let result = String::from_utf8_lossy(&data[..total_size as usize]).to_string();
+
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn test_encode_ansi() -> Result<()> {
+        assert_debug_snapshot!(
+            run_encode_ansi_test(
+                &[
+                    255, 0, 0, 255, // (0, 0)
+                    0, 0, 255, 255, // (1, 0)
+                    0, 255, 0, 255, // (0, 1)
+                    255, 255, 255, 255, // (1, 1)
+                ],
+                (2, 2),
+                &[33, 42]
+            )
+            .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_encode_ansi_multiple_of_4() -> Result<()> {
+        assert_debug_snapshot!(
+            run_encode_ansi_test(
+                &[
+                    255, 0, 0, 255, // (0, 0)
+                    0, 255, 0, 255, // (1, 0)
+                    0, 0, 11, 255, // (0, 1)
+                    1, 0, 0, 255, // (1, 1)
+                    255, 0, 0, 255, // (0, 2)
+                    0, 255, 0, 255, // (1, 2)
+                ],
+                (2, 3),
+                &[32, 36, 18, 23]
+            )
+            .await?
+        );
         Ok(())
     }
 }

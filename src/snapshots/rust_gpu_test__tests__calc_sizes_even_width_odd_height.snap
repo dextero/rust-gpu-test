@@ -1,0 +1,8 @@
+---
+source: src/main.rs
+expression: "run_calc_sizes_test(&[255, 0, 0, 255, 0, 255, 0, 255,], (2, 1)).await?"
+---
+[
+    18,
+    23,
+]

@@ -1,0 +1,5 @@
+---
+source: src/main.rs
+expression: "run_encode_ansi_test(&pixels, texture_size, sizes).await?"
+---
+"\u{1b}[38;2;255;0;0m\u{1b}[48;2;0;0;11m▀\u{1b}[38;2;0;255;0m\u{1b}[48;2;1;0;0m▀\u{1b}[0m\n\u{1b}[38;2;255;0;0m▀\u{1b}[38;2;0;255;0m▀\u{1b}[0m\n"
