@@ -468,8 +468,16 @@ mod tests {
         invoker: &GpuFuncInvoker,
         pixels: &[u8],
         texture_size: (u32, u32),
-        offsets: &[u32],
+        sizes: &[u32],
     ) -> Result<String> {
+        let mut offsets = Vec::with_capacity(sizes.len());
+        let mut current_offset = 0;
+        for size in sizes {
+            offsets.push(current_offset);
+            current_offset += *size;
+        }
+        let total_size = current_offset;
+
         let texture = device.create_texture_with_data(
             queue,
             &TextureDescriptor {
@@ -492,12 +500,11 @@ mod tests {
 
         let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("offsets_buffer"),
-            contents: bytemuck::cast_slice(offsets),
+            contents: bytemuck::cast_slice(&offsets),
             usage: BufferUsages::STORAGE,
         });
 
-        let total_size = offsets.iter().sum::<u32>() as u64;
-        let output_buffer_size = total_size.max(1);
+        let output_buffer_size = (total_size as u64).div_ceil(4) * 4;
         let output_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("output_buffer"),
             size: output_buffer_size,
@@ -545,7 +552,7 @@ mod tests {
         rx.await??;
 
         let data = buffer_slice.get_mapped_range();
-        let result = String::from_utf8_lossy(&data).to_string();
+        let result = String::from_utf8_lossy(&data[..total_size as usize]).to_string();
 
         Ok(result)
     }
@@ -562,9 +569,9 @@ mod tests {
             255, 255, 255, 255, // Bottom-right: White
         ];
         let texture_size = (2, 2);
-        let offsets = &[0, 33];
+        let sizes = &[33, 42];
         let result =
-            run_encode_ansi_test(&device, &queue, &encode_ansi_invoker, &pixels, texture_size, offsets)
+            run_encode_ansi_test(&device, &queue, &encode_ansi_invoker, &pixels, texture_size, sizes)
                 .await?;
 
         let expected = "\x1b[38;2;255;0;0m\x1b[48;2;0;255;0m\u{2580}\x1b[38;2;0;0;255m\x1b[48;2;255;255;255m\u{2580}\x1b[0m\n";
