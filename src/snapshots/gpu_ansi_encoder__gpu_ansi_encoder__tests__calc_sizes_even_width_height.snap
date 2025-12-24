@@ -1,0 +1,8 @@
+---
+source: src/gpu_ansi_encoder.rs
+expression: "run_calc_sizes_test(&[255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255,\n255, 255, 255,], (2, 2)).await?"
+---
+[
+    33,
+    42,
+]
