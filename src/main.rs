@@ -462,4 +462,115 @@ mod tests {
         Ok(())
     }
 
+    async fn run_encode_ansi_test(
+        device: &Device,
+        queue: &Queue,
+        invoker: &GpuFuncInvoker,
+        pixels: &[u8],
+        texture_size: (u32, u32),
+        offsets: &[u32],
+    ) -> Result<String> {
+        let texture = device.create_texture_with_data(
+            queue,
+            &TextureDescriptor {
+                label: Some("test_texture"),
+                size: wgpu::Extent3d {
+                    width: texture_size.0,
+                    height: texture_size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: TextureFormat::Rgba8Uint,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[TextureFormat::Rgba8Uint],
+            },
+            wgpu::wgt::TextureDataOrder::LayerMajor,
+            pixels,
+        );
+
+        let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("offsets_buffer"),
+            contents: bytemuck::cast_slice(offsets),
+            usage: BufferUsages::STORAGE,
+        });
+
+        let total_size = offsets.iter().sum::<u32>() as u64;
+        let output_buffer_size = total_size.max(1);
+        let output_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("output_buffer"),
+            size: output_buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("staging_buffer"),
+            size: output_buffer_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_encoder"),
+        });
+
+        let texture_view = texture.create_view(&Default::default());
+        invoker.invoke(
+            &mut encoder,
+            [
+                BindingResource::TextureView(&texture_view),
+                offsets_buffer.as_entire_binding(),
+                output_buffer.as_entire_binding(),
+            ],
+            (texture_size.0, (texture_size.1 + 1) / 2),
+        );
+
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
+
+        let submission_index = queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        buffer_slice.map_async(MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+
+        device.poll(wgpu::wgt::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        })?;
+
+        rx.await??;
+
+        let data = buffer_slice.get_mapped_range();
+        let result = String::from_utf8_lossy(&data).to_string();
+
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn test_encode_ansi() -> Result<()> {
+        let (device, queue) = get_device().await?;
+        let encode_ansi_invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
+
+        let pixels: Vec<u8> = vec![
+            255, 0, 0, 255, // Top-left: Red
+            0, 0, 255, 255, // Top-right: Blue
+            0, 255, 0, 255, // Bottom-left: Green
+            255, 255, 255, 255, // Bottom-right: White
+        ];
+        let texture_size = (2, 2);
+        let offsets = &[0, 33];
+        let result =
+            run_encode_ansi_test(&device, &queue, &encode_ansi_invoker, &pixels, texture_size, offsets)
+                .await?;
+
+        let expected = "\x1b[38;2;255;0;0m\x1b[48;2;0;255;0m\u{2580}\x1b[38;2;0;0;255m\x1b[48;2;255;255;255m\u{2580}\x1b[0m\n";
+        assert_eq!(result.len(), expected.len());
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
 }
