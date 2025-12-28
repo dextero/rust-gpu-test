@@ -1,0 +1,10 @@
+---
+source: src/gpu_ansi_encoder.rs
+expression: "result.iter().skip(127).step_by(128).collect::<Vec<_>>()"
+---
+[
+    1,
+    2,
+    3,
+    4,
+]

@@ -580,7 +580,20 @@ mod tests {
         assert_debug_snapshot!(run_prefix_sum_test(&sparse_ones, 2).await?);
         Ok(())
     }
- 
+
+    #[tokio::test]
+    async fn test_prefix_sum_512_with_stride_128() -> Result<()> {
+        let ones = vec![1u32; 512];
+        let result = run_prefix_sum_test(&ones, 128).await?;
+        assert_debug_snapshot!(result.iter().skip(127).step_by(128).collect::<Vec<_>>());
+        for n in 0..result.len() {
+            if n % 128 != 127 {
+                assert_eq!(result[n], 1, "at index {n}");
+            }
+        }
+        Ok(())
+    }
+
     async fn run_encode_ansi_test(
         pixels: &[u8],
         texture_size: (u32, u32),
