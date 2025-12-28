@@ -1,0 +1,14 @@
+---
+source: src/gpu_ansi_encoder.rs
+expression: "run_prefix_sum_test(&[35, 37, 36, 41, 20, 19, 20, 24], 1).await?"
+---
+[
+    35,
+    72,
+    108,
+    149,
+    169,
+    188,
+    208,
+    232,
+]

@@ -4,15 +4,19 @@
 const WORKGROUP_SIZE: u32 = 256u;
 
 @compute @workgroup_size(WORKGROUP_SIZE)
-fn add_partial_sums(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = global_id.x;
-    if (i < WORKGROUP_SIZE) {
-        return;
+fn add_partial_sums(@builtin(num_workgroups) num_workgroups: vec3<u32>,
+                    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+                    @builtin(global_invocation_id) global_id: vec3<u32>,
+                    @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let elems = arrayLength(&buffer);
+    let elems_per_workgroup = (elems + num_workgroups.x - 1u) / num_workgroups.x;
+
+    for (var i = local_id.x; i < elems_per_workgroup; i += WORKGROUP_SIZE) {
+        let src_idx = (i & WORKGROUP_SIZE) - 1u;
+        buffer[i] += buffer[src_idx];
     }
-    let src_idx = (i & WORKGROUP_SIZE) - 1;
-    let n = arrayLength(&buffer);
-    buffer[i] += buffer[src_idx];
-    if (i == n - 1) {
-        total_size = buffer[i];
+
+    if (workgroup_id.x == num_workgroups.x - 1 && local_id.x == WORKGROUP_SIZE - 1) {
+        total_size = buffer[elems - 1];
     }
 }

@@ -222,9 +222,14 @@ impl GpuAnsiEncoder {
             &prefix_sum_shader,
             "prefix_sum",
         ));
+
+        let add_partial_sums_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("wgsl/add_partial_sums.wgsl"),
+            source: ShaderSource::Wgsl(include_str!("wgsl/add_partial_sums.wgsl").into()),
+        });
         let add_partial_sums = AddPartialSums(GpuFunc::from_shader(
             device.clone(),
-            &prefix_sum_shader,
+            &add_partial_sums_shader,
             "add_partial_sums",
         ));
 
@@ -331,7 +336,6 @@ impl GpuAnsiEncoder {
                 .try_into()?,
         )
         .try_into()?;
-        let size = size - 1;
 
         eprintln!("size = {} ({:#x})", size, size);
         let rounded_size = u64::try_from(size.div_ceil(4) * 4)?;
@@ -736,6 +740,42 @@ mod tests {
                 &[41, 46]
             )
             .await?
+        );
+        Ok(())
+    }
+
+    const RAINBOW_4X3: &[u8] = &[
+        255, 0, 0, 255, //   15
+        255, 191, 0, 255, // 17
+        127, 255, 0, 255, // 17
+        0, 255, 63, 255, //  16
+        255, 191, 0, 255, //   +17+3  =35
+        127, 255, 0, 255, //   +17+3  =37
+        0, 255, 63, 255, //    +16+3  =36
+        0, 255, 255, 255, //   +17+3+5=41
+        127, 255, 0, 255, // 17+3     =20
+        0, 255, 63, 255, //  16+3     =19
+        0, 255, 255, 255, // 17+3     =20
+        0, 63, 255, 255, //  16+3+5   =24
+    ];
+
+    #[tokio::test]
+    async fn test_rainbow_4x3_calc_sizes() -> Result<()> {
+        assert_debug_snapshot!(run_calc_sizes_test(RAINBOW_4X3, (4, 3)).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rainbow_4x3_prefix_sum() -> Result<()> {
+        assert_debug_snapshot!(run_prefix_sum_test(&[35, 37, 36, 41, 20, 19, 20, 24], 1).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rainbow_4x3_encode_ansi() -> Result<()> {
+        assert_debug_snapshot!(
+            run_encode_ansi_test(&RAINBOW_4X3, (4, 3), &[35, 37, 36, 41, 20, 19, 20, 24])
+                .await?
         );
         Ok(())
     }

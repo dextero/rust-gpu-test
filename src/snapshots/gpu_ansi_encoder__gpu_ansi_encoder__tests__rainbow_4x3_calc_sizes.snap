@@ -1,0 +1,14 @@
+---
+source: src/gpu_ansi_encoder.rs
+expression: "run_calc_sizes_test(RAINBOW_4X3, (4, 3)).await?"
+---
+[
+    35,
+    37,
+    36,
+    41,
+    20,
+    19,
+    20,
+    24,
+]

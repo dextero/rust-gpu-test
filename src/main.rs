@@ -18,8 +18,10 @@ async fn main() -> Result<()> {
 
     let size = term_size::dimensions().ok_or_else(|| anyhow::anyhow!("failed to get term size"))?;
     let size = (size.0, size.1 * 2);
+    let size = (4, 3);
 
     let pixels: Vec<u8> = gpu_ansi_encoder::gen_pixels(size.0, size.1);
+    dbg!(&pixels);
     let texture = device.create_texture_with_data(
         &queue,
         &TextureDescriptor {
