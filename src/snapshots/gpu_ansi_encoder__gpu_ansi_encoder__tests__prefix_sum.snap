@@ -2,13 +2,10 @@
 source: src/gpu_ansi_encoder.rs
 expression: "run_prefix_sum_test(&[10, 20, 5, 30, 15]).await?"
 ---
-(
-    [
-        0,
-        10,
-        30,
-        35,
-        65,
-    ],
+[
+    10,
+    30,
+    35,
+    65,
     80,
-)
+]

@@ -1,9 +1,9 @@
 use anyhow::Result;
-use std::borrow::Cow;
 use std::rc::Rc;
 use wgpu::BindGroupDescriptor;
 use wgpu::BindGroupEntry;
 use wgpu::BindingResource;
+use wgpu::Buffer;
 use wgpu::BufferDescriptor;
 use wgpu::BufferUsages;
 use wgpu::CommandEncoder;
@@ -11,123 +11,255 @@ use wgpu::ComputePipeline;
 use wgpu::Device;
 use wgpu::MapMode;
 use wgpu::Queue;
+use wgpu::ShaderModule;
 use wgpu::ShaderModuleDescriptor;
 use wgpu::ShaderSource;
 use wgpu::Texture;
+use wgpu::util::BufferInitDescriptor;
+use wgpu::util::DeviceExt;
 
-struct GpuFuncInvoker {
+struct GpuFunc {
     device: Rc<Device>,
     pipeline: ComputePipeline,
 }
 
-impl GpuFuncInvoker {
-    pub(crate) fn from_source(
-        device: Rc<Device>,
-        label: &str,
-        shader_source: Cow<'static, str>,
-    ) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some(&format!("{}_shader", label)),
-            source: ShaderSource::Wgsl(shader_source),
-        });
-
+impl GpuFunc {
+    pub(crate) fn from_shader(device: Rc<Device>, shader: &ShaderModule, entry: &str) -> Self {
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(&format!("{}_pipeline", label)),
+            label: Some(&format!("{}_pipeline", entry)),
             layout: None,
             module: &shader,
-            entry_point: None,
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             cache: None,
         });
 
         Self { device, pipeline }
     }
+}
 
-    pub(crate) fn invoke<'a>(
-        &self,
-        encoder: &mut CommandEncoder,
-        args: impl IntoIterator<Item = BindingResource<'a>>,
-        workgroup_size: (u32, u32),
-    ) {
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+struct CalcSizes(GpuFunc);
+
+impl CalcSizes {
+    pub fn call(&self, encoder: &mut CommandEncoder, texture: &Texture) -> Buffer {
+        let texture_size = texture.size();
+        let num_pixels = texture_size.width * texture_size.height;
+        let offsets_size_bytes = usize::try_from(num_pixels).unwrap() * std::mem::size_of::<u32>();
+        let offsets_buffer = self.0.device.create_buffer(&BufferDescriptor {
+            label: Some("sizes_offsets"),
+            size: offsets_size_bytes.try_into().unwrap(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
             label: Some("calc_sizes_bind_group"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &args
-                .into_iter()
-                .enumerate()
-                .map(|(idx, resource)| BindGroupEntry {
-                    binding: idx.try_into().unwrap(),
-                    resource,
-                })
-                .collect::<Vec<_>>(),
+            layout: &self.0.pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(
+                        &texture.create_view(&Default::default()),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: offsets_buffer.as_entire_binding(),
+                },
+            ],
         });
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("calc_sizes"),
             timestamp_writes: None,
         });
-        compute_pass.set_pipeline(&self.pipeline);
+        compute_pass.set_pipeline(&self.0.pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(workgroup_size.0, workgroup_size.1, 1);
+        compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+
+        offsets_buffer
     }
 }
 
-macro_rules! static_func_invoker {
-    ($device:expr, $src:literal) => {{
-        $crate::gpu_ansi_encoder::GpuFuncInvoker::from_source(
-            $device,
-            $src,
-            std::borrow::Cow::Borrowed(include_str!($src)),
-        )
-    }};
+struct PrefixSum(GpuFunc);
+
+impl PrefixSum {
+    pub fn call(&self, encoder: &mut CommandEncoder, buffer: &Buffer, input_stride: u32) {
+        let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
+        let num_threads = buffer_size_elems / u64::from(input_stride);
+        let stride_buffer = self.0.device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("input_stride_buffer"),
+            contents: &input_stride.to_le_bytes(),
+            usage: BufferUsages::STORAGE,
+        });
+        let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("prefix_sum_bind_group"),
+            layout: &self.0.pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: stride_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("prefix_sum"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(&self.0.pipeline);
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(u32::try_from(num_threads).unwrap(), 1, 1);
+    }
+}
+
+struct AddPartialSums(GpuFunc);
+
+impl AddPartialSums {
+    pub fn call(&self, encoder: &mut CommandEncoder, buffer: &Buffer) -> Buffer {
+        let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
+        let total_size = self.0.device.create_buffer(&BufferDescriptor {
+            label: Some("total_size_buffer"),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            size: std::mem::size_of::<u32>().try_into().unwrap(),
+            mapped_at_creation: false,
+        });
+        let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("add_partial_sums"),
+            layout: &self.0.pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: total_size.as_entire_binding(),
+                },
+            ],
+        });
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("add_partial_sums"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(&self.0.pipeline);
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(u32::try_from(buffer_size_elems).unwrap(), 1, 1);
+        total_size
+    }
+}
+
+struct EncodeAnsi(GpuFunc);
+
+impl EncodeAnsi {
+    pub fn call(
+        &self,
+        encoder: &mut CommandEncoder,
+        texture: &Texture,
+        output_offsets: &Buffer,
+        output: &Buffer,
+    ) {
+        let num_pixels = texture.size().width * texture.size().height;
+        let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("encode_ansi_bind_group"),
+            layout: &self.0.pipeline.get_bind_group_layout(0),
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(
+                        &texture.create_view(&Default::default()),
+                    ),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: output_offsets.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        });
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("encode_ansi"),
+            timestamp_writes: None,
+        });
+        compute_pass.set_pipeline(&self.0.pipeline);
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+    }
 }
 
 pub struct GpuAnsiEncoder {
     device: Rc<Device>,
     queue: Rc<Queue>,
-    calc_sizes_invoker: GpuFuncInvoker,
-    prefix_sum_invoker: GpuFuncInvoker,
-    encode_invoker: GpuFuncInvoker,
+    calc_sizes: CalcSizes,
+    prefix_sum: PrefixSum,
+    add_partial_sums: AddPartialSums,
+    encode_ansi: EncodeAnsi,
 }
 
 impl GpuAnsiEncoder {
     pub async fn new(device: Rc<Device>, queue: Rc<Queue>) -> Result<Self> {
-        let calc_sizes_invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
-        let prefix_sum_invoker = static_func_invoker!(device.clone(), "wgsl/prefix_sum.wgsl");
-        let encode_invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
+        let calc_sizes_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("wgsl/calc_sizes.wgsl"),
+            source: ShaderSource::Wgsl(include_str!("wgsl/calc_sizes.wgsl").into()),
+        });
+        let calc_sizes = CalcSizes(GpuFunc::from_shader(
+            device.clone(),
+            &calc_sizes_shader,
+            "calc_sizes",
+        ));
+
+        let prefix_sum_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("wgsl/prefix_sum.wgsl"),
+            source: ShaderSource::Wgsl(include_str!("wgsl/prefix_sum.wgsl").into()),
+        });
+        let prefix_sum = PrefixSum(GpuFunc::from_shader(
+            device.clone(),
+            &prefix_sum_shader,
+            "prefix_sum",
+        ));
+        let add_partial_sums = AddPartialSums(GpuFunc::from_shader(
+            device.clone(),
+            &prefix_sum_shader,
+            "add_partial_sums",
+        ));
+
+        let encode_ansi_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("encode_ansi"),
+            source: ShaderSource::Wgsl(include_str!("wgsl/encode_ansi.wgsl").into()),
+        });
+        let encode_ansi = EncodeAnsi(GpuFunc::from_shader(
+            device.clone(),
+            &encode_ansi_shader,
+            "encode_ansi",
+        ));
 
         Ok(Self {
             device,
             queue,
-            calc_sizes_invoker,
-            prefix_sum_invoker,
-            encode_invoker,
+            calc_sizes,
+            prefix_sum,
+            add_partial_sums,
+            encode_ansi,
         })
     }
 
     pub async fn ansi_from_texture(&self, texture: &Texture) -> Result<String> {
         let texture_size = texture.size();
         let num_pixels = texture_size.width * texture_size.height;
-        let offsets_size_bytes = usize::try_from(num_pixels)? * std::mem::size_of::<u32>();
-        let offsets_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("sizes_offsets"),
-            size: offsets_size_bytes.try_into()?,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let total_size_device_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_device"),
-            size: std::mem::size_of::<u32>().try_into().unwrap(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let total_size_host_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_host"),
-            size: std::mem::size_of::<u32>().try_into().unwrap(),
+            label: Some("ansi_output_host"),
+            size: std::mem::size_of::<u32>().try_into()?,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let max_output_size_bytes: usize = usize::try_from(num_pixels)?
-            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len();
+            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len()
+            + usize::try_from(texture_size.height)? * "\x1b[0m\n".len();
         let rounded_max_output_size_bytes = max_output_size_bytes.div_ceil(4) * 4;
         let output_device_buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("ansi_output_device"),
@@ -147,33 +279,16 @@ impl GpuAnsiEncoder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("encode_ansi"),
             });
-        let texture_view = texture.create_view(&Default::default());
 
-        self.calc_sizes_invoker.invoke(
-            &mut encoder,
-            [
-                BindingResource::TextureView(&texture_view),
-                offsets_buffer.as_entire_binding(),
-            ],
-            (texture.size().width, texture.size().height.div_ceil(2)),
-        );
-        self.prefix_sum_invoker.invoke(
-            &mut encoder,
-            [
-                offsets_buffer.as_entire_binding(),
-                total_size_device_buffer.as_entire_binding(),
-            ],
-            (1, 1),
-        );
-        self.encode_invoker.invoke(
-            &mut encoder,
-            [
-                BindingResource::TextureView(&texture_view),
-                offsets_buffer.as_entire_binding(),
-                output_device_buffer.as_entire_binding(),
-            ],
-            (texture.size().width, texture.size().height.div_ceil(2)),
-        );
+        let offsets = self.calc_sizes.call(&mut encoder, texture);
+        let mut stride = 1;
+        while stride < num_pixels {
+            self.prefix_sum.call(&mut encoder, &offsets, stride);
+            stride *= 256;
+        }
+        let total_size_device_buffer = self.add_partial_sums.call(&mut encoder, &offsets);
+        self.encode_ansi
+            .call(&mut encoder, texture, &offsets, &output_device_buffer);
 
         encoder.copy_buffer_to_buffer(
             &total_size_device_buffer,
@@ -250,9 +365,11 @@ mod tests {
     use insta::assert_debug_snapshot;
     use std::rc::Rc;
     use wgpu::{
-        BindingResource, BufferDescriptor, BufferUsages, Device, MapMode, Queue, TextureDescriptor,
-        TextureFormat, TextureUsages, util::DeviceExt,
+        BufferDescriptor, BufferUsages, Device, MapMode, Queue, ShaderModuleDescriptor,
+        ShaderSource, TextureDescriptor, TextureFormat, TextureUsages, util::DeviceExt,
     };
+
+    use crate::gpu_ansi_encoder::{CalcSizes, EncodeAnsi, GpuFunc, PrefixSum};
 
     async fn get_device() -> Result<(Rc<Device>, Queue)> {
         let instance = wgpu::Instance::default();
@@ -267,7 +384,11 @@ mod tests {
 
     async fn run_calc_sizes_test(pixels: &[u8], texture_size: (u32, u32)) -> Result<Vec<u32>> {
         let (device, queue) = get_device().await?;
-        let invoker = static_func_invoker!(device.clone(), "wgsl/calc_sizes.wgsl");
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(include_str!("wgsl/calc_sizes.wgsl").into()),
+        });
+        let calc_sizes = CalcSizes(GpuFunc::from_shader(device.clone(), &shader, "calc_sizes"));
 
         let texture = device.create_texture_with_data(
             &queue,
@@ -292,13 +413,6 @@ mod tests {
         let num_outputs = texture_size.0 * ((texture_size.1 + 1) / 2);
         let sizes_buffer_size = (num_outputs * std::mem::size_of::<u32>() as u32) as u64;
 
-        let sizes_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("sizes_buffer"),
-            size: sizes_buffer_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
         let staging_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("staging_buffer"),
             size: sizes_buffer_size,
@@ -310,15 +424,7 @@ mod tests {
             label: Some("test_encoder"),
         });
 
-        let texture_view = texture.create_view(&Default::default());
-        invoker.invoke(
-            &mut encoder,
-            [
-                BindingResource::TextureView(&texture_view),
-                sizes_buffer.as_entire_binding(),
-            ],
-            (texture_size.0, (texture_size.1 + 1) / 2),
-        );
+        let sizes_buffer = calc_sizes.call(&mut encoder, &texture);
 
         encoder.copy_buffer_to_buffer(&sizes_buffer, 0, &staging_buffer, 0, sizes_buffer_size);
 
@@ -405,21 +511,18 @@ mod tests {
         Ok(())
     }
 
-    async fn run_prefix_sum_test(sizes: &[u32]) -> Result<(Vec<u32>, u32)> {
+    async fn run_prefix_sum_test(sizes: &[u32]) -> Result<Vec<u32>> {
         let (device, queue) = get_device().await?;
-        let invoker = static_func_invoker!(device.clone(), "wgsl/prefix_sum.wgsl");
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(include_str!("wgsl/prefix_sum.wgsl").into()),
+        });
+        let prefix_sum = PrefixSum(GpuFunc::from_shader(device.clone(), &shader, "prefix_sum"));
 
         let sizes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sizes_buffer"),
             contents: bytemuck::cast_slice(sizes),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        });
-
-        let total_size_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_buffer"),
-            size: std::mem::size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
         });
 
         let sizes_staging_buffer = device.create_buffer(&BufferDescriptor {
@@ -429,25 +532,11 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        let total_size_staging_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_staging_buffer"),
-            size: total_size_buffer.size(),
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test_encoder"),
         });
 
-        invoker.invoke(
-            &mut encoder,
-            [
-                sizes_buffer.as_entire_binding(),
-                total_size_buffer.as_entire_binding(),
-            ],
-            (1, 1),
-        );
+        prefix_sum.call(&mut encoder, &sizes_buffer, 1);
 
         encoder.copy_buffer_to_buffer(
             &sizes_buffer,
@@ -455,13 +544,6 @@ mod tests {
             &sizes_staging_buffer,
             0,
             sizes_buffer.size(),
-        );
-        encoder.copy_buffer_to_buffer(
-            &total_size_buffer,
-            0,
-            &total_size_staging_buffer,
-            0,
-            total_size_buffer.size(),
         );
 
         let submission_index = queue.submit(Some(encoder.finish()));
@@ -472,27 +554,17 @@ mod tests {
             sizes_tx.send(result).unwrap();
         });
 
-        let total_size_slice = total_size_staging_buffer.slice(..);
-        let (total_size_tx, total_size_rx) = tokio::sync::oneshot::channel();
-        total_size_slice.map_async(MapMode::Read, move |result| {
-            total_size_tx.send(result).unwrap();
-        });
-
         device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
 
         sizes_rx.await??;
-        total_size_rx.await??;
 
         let sizes_data = sizes_slice.get_mapped_range();
         let offsets: Vec<u32> = bytemuck::cast_slice(&sizes_data).to_vec();
 
-        let total_size_data = total_size_slice.get_mapped_range();
-        let total_size: u32 = bytemuck::cast_slice(&total_size_data)[0];
-
-        Ok((offsets, total_size))
+        Ok(offsets)
     }
 
     #[tokio::test]
@@ -507,7 +579,11 @@ mod tests {
         sizes: &[u32],
     ) -> Result<String> {
         let (device, queue) = get_device().await?;
-        let invoker = static_func_invoker!(device.clone(), "wgsl/encode_ansi.wgsl");
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(include_str!("wgsl/encode_ansi.wgsl").into()),
+        });
+        let encode_ansi = EncodeAnsi(GpuFunc::from_shader(device.clone(), &shader, "encode_ansi"));
 
         let mut offsets = Vec::with_capacity(sizes.len());
         let mut current_offset = 0;
@@ -562,16 +638,7 @@ mod tests {
             label: Some("test_encoder"),
         });
 
-        let texture_view = texture.create_view(&Default::default());
-        invoker.invoke(
-            &mut encoder,
-            [
-                BindingResource::TextureView(&texture_view),
-                offsets_buffer.as_entire_binding(),
-                output_buffer.as_entire_binding(),
-            ],
-            (texture_size.0, (texture_size.1 + 1) / 2),
-        );
+        encode_ansi.call(&mut encoder, &texture, &offsets_buffer, &output_buffer);
 
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
 
