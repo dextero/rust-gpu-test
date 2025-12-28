@@ -85,7 +85,7 @@ struct PrefixSum(GpuFunc);
 impl PrefixSum {
     pub fn call(&self, encoder: &mut CommandEncoder, buffer: &Buffer, input_stride: u32) {
         let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
-        let num_threads = buffer_size_elems / u64::from(input_stride);
+        let num_threads = (buffer_size_elems / u64::from(input_stride)).min(128 * 256);
         let stride_buffer = self.0.device.create_buffer_init(&BufferInitDescriptor {
             label: Some("input_stride_buffer"),
             contents: &input_stride.to_le_bytes(),
@@ -161,7 +161,7 @@ impl EncodeAnsi {
         output_offsets: &Buffer,
         output: &Buffer,
     ) {
-        let num_pixels = texture.size().width * texture.size().height;
+        let num_pixels = (texture.size().width * texture.size().height).min(128 * 256);
         let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
             label: Some("encode_ansi_bind_group"),
             layout: &self.0.pipeline.get_bind_group_layout(0),
@@ -511,7 +511,7 @@ mod tests {
         Ok(())
     }
 
-    async fn run_prefix_sum_test(sizes: &[u32]) -> Result<Vec<u32>> {
+    async fn run_prefix_sum_test(sizes: &[u32], stride: u32) -> Result<Vec<u32>> {
         let (device, queue) = get_device().await?;
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
@@ -536,7 +536,7 @@ mod tests {
             label: Some("test_encoder"),
         });
 
-        prefix_sum.call(&mut encoder, &sizes_buffer, 1);
+        prefix_sum.call(&mut encoder, &sizes_buffer, stride);
 
         encoder.copy_buffer_to_buffer(
             &sizes_buffer,
@@ -554,10 +554,11 @@ mod tests {
             sizes_tx.send(result).unwrap();
         });
 
-        device.poll(wgpu::wgt::PollType::Wait {
+        let status = device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
+        dbg!(status);
 
         sizes_rx.await??;
 
@@ -569,10 +570,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_prefix_sum() -> Result<()> {
-        assert_debug_snapshot!(run_prefix_sum_test(&[10, 20, 5, 30, 15]).await?);
+        assert_debug_snapshot!(run_prefix_sum_test(&[10, 20, 5, 30, 15], 1).await?);
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_prefix_sum_with_stride() -> Result<()> {
+        let sparse_ones = vec![1u32; 16];
+        assert_debug_snapshot!(run_prefix_sum_test(&sparse_ones, 2).await?);
+        Ok(())
+    }
+ 
     async fn run_encode_ansi_test(
         pixels: &[u8],
         texture_size: (u32, u32),
