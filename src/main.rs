@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 use wgpu::{TextureFormat, TextureUsages, util::DeviceExt, wgt::TextureDescriptor};
 
 mod gpu_ansi_encoder;
@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default())
         .await?;
-    let device = Rc::new(device);
+    let device = Arc::new(device);
     let queue = Rc::new(queue);
 
     let size = term_size::dimensions().ok_or_else(|| anyhow::anyhow!("failed to get term size"))?;
@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
     );
 
     let ansi_encoder = gpu_ansi_encoder::GpuAnsiEncoder::new(device, queue).await?;
-    let s = ansi_encoder.ansi_from_texture(&texture).await?;
-    print!("{s}");
-
-    Ok(())
+    loop {
+        let s = ansi_encoder.ansi_from_texture(&texture).await?;
+        print!("{s}");
+    }
 }

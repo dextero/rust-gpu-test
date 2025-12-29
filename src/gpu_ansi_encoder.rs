@@ -1,6 +1,5 @@
 use anyhow::Result;
 use pin_project::pin_project;
-use zerocopy::IntoByteSlice;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -184,12 +183,12 @@ where
 }
 
 struct GpuFunc {
-    device: Rc<Device>,
+    device: Arc<Device>,
     pipeline: ComputePipeline,
 }
 
 impl GpuFunc {
-    pub(crate) fn from_shader(device: Rc<Device>, shader: &ShaderModule, entry: &str) -> Self {
+    pub(crate) fn from_shader(device: Arc<Device>, shader: &ShaderModule, entry: &str) -> Self {
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("{}_pipeline", entry)),
             layout: None,
@@ -418,7 +417,7 @@ impl EncodeAnsi {
 }
 
 pub struct GpuAnsiEncoder {
-    device: Rc<Device>,
+    device: Arc<Device>,
     queue: Rc<Queue>,
     calc_sizes: CalcSizes,
     prefix_sum: PrefixSum,
@@ -427,7 +426,7 @@ pub struct GpuAnsiEncoder {
 }
 
 impl GpuAnsiEncoder {
-    pub async fn new(device: Rc<Device>, queue: Rc<Queue>) -> Result<Self> {
+    pub async fn new(device: Arc<Device>, queue: Rc<Queue>) -> Result<Self> {
         let calc_sizes_shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("wgsl/calc_sizes.wgsl"),
             source: ShaderSource::Wgsl(include_str!("wgsl/calc_sizes.wgsl").into()),
@@ -467,6 +466,14 @@ impl GpuAnsiEncoder {
             &encode_ansi_shader,
             "encode_ansi",
         ));
+
+        let device2 = device.clone();
+        tokio::spawn(async move {
+            loop {
+                device2.poll(PollType::Poll).unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
 
         Ok(Self {
             device,
@@ -526,7 +533,7 @@ mod tests {
     use anyhow::Result;
     use insta::assert_debug_snapshot;
     use itertools::Itertools;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use wgpu::{
         Device, PollType, Queue, ShaderModuleDescriptor, ShaderSource, TextureDescriptor,
         TextureFormat, TextureUsages, util::DeviceExt,
@@ -537,7 +544,7 @@ mod tests {
         AddPartialSums, CalcSizes, EncodeAnsi, GpuFunc, InspectableBuffer, PrefixSum,
     };
 
-    async fn get_device() -> Result<(Rc<Device>, Queue)> {
+    async fn get_device() -> Result<(Arc<Device>, Queue)> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -545,7 +552,7 @@ mod tests {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await?;
-        Ok((Rc::new(device), queue))
+        Ok((Arc::new(device), queue))
     }
 
     async fn run_calc_sizes_test(pixels: &[u8], texture_size: (u32, u32)) -> Result<Vec<u32>> {
