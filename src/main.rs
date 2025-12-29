@@ -6,6 +6,8 @@ mod gpu_ansi_encoder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    console_subscriber::init();
+
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())

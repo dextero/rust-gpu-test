@@ -1,13 +1,19 @@
 use anyhow::Result;
 use pin_project::pin_project;
+use zerocopy::IntoByteSlice;
+use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::Poll;
+use std::task::Waker;
 use wgpu::BindGroupDescriptor;
 use wgpu::BindGroupEntry;
 use wgpu::BindingResource;
 use wgpu::Buffer;
 use wgpu::BufferDescriptor;
 use wgpu::BufferUsages;
+use wgpu::CommandEncoderDescriptor;
 use wgpu::ComputePipeline;
 use wgpu::Device;
 use wgpu::MapMode;
@@ -20,21 +26,105 @@ use wgpu::SubmissionIndex;
 use wgpu::Texture;
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
-use wgpu::wgt::CommandEncoderDescriptor;
+use zerocopy::Immutable;
+use zerocopy::TryFromBytes;
+
+struct InspectableBuffer {
+    device_buffer: Buffer,
+    host_buffer: Buffer,
+}
+
+impl InspectableBuffer {
+    fn new(device: &Device, label: &'static str, size: usize) -> Result<Self> {
+        let label = Some(label);
+        let size = size.try_into()?;
+        let device_buffer = device.create_buffer(&BufferDescriptor {
+            label,
+            size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let host_buffer = device.create_buffer(&BufferDescriptor {
+            label,
+            size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Self {
+            device_buffer,
+            host_buffer,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_data(device: &Device, label: &'static str, contents: &[u8]) -> Result<Self> {
+        let label = Some(label);
+        let device_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label,
+            contents,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let host_buffer = device.create_buffer(&BufferDescriptor {
+            label,
+            size: contents.len().try_into()?,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Self {
+            device_buffer,
+            host_buffer,
+        })
+    }
+
+    async fn read<'a, T: Immutable + Copy + 'static>(
+        &'a self,
+        device: &Device,
+        queue: &Queue,
+    ) -> Result<Vec<T>>
+    where
+        [T]: TryFromBytes,
+    {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(
+            &self.device_buffer,
+            0,
+            &self.host_buffer,
+            0,
+            self.host_buffer.size(),
+        );
+        queue.submit(Some(encoder.finish()));
+        let bytes = async_map::<T>(device, self.host_buffer.clone()).await?;
+        Ok(bytes)
+    }
+
+    fn size(&self) -> u64 {
+        self.device_buffer.size()
+    }
+
+    fn as_entire_binding(&self) -> BindingResource<'_> {
+        self.device_buffer.as_entire_binding()
+    }
+}
 
 #[pin_project]
-struct BufferMapFuture<'d, InnerFut: Future<Output = Result<()>>> {
+struct BufferMapFuture<'d, InnerFut: Future<Output = Result<()>>, T: Immutable + Clone + 'static>
+where
+    [T]: TryFromBytes,
+{
     device: &'d Device,
     buffer: Buffer,
     #[pin]
     inner: InnerFut,
+    waker: Arc<Mutex<Option<Waker>>>,
+    _t: PhantomData<T>,
 }
 
-impl<'d, InnerFut> Future for BufferMapFuture<'d, InnerFut>
+impl<'d, InnerFut, T: Immutable + Clone + 'static> Future for BufferMapFuture<'d, InnerFut, T>
 where
     InnerFut: Future<Output = Result<()>>,
+    [T]: TryFromBytes,
 {
-    type Output = Result<Vec<u8>>;
+    type Output = Result<Vec<T>>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match self.device.poll(PollType::Poll) {
@@ -44,21 +134,52 @@ where
 
         let project = self.project();
         match project.inner.poll(cx) {
-            Poll::Ready(_) => Poll::Ready(Ok(project.buffer.get_mapped_range(..).to_vec())),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => {
+                let size = usize::try_from(project.buffer.size()).unwrap();
+                if size % std::mem::size_of::<T>() != 0 {
+                    panic!(
+                        "cannot read buffer of size {}, required alignment = {}",
+                        project.buffer.size(),
+                        std::mem::size_of::<T>()
+                    );
+                }
+                let view = project.buffer.get_mapped_range(..).to_vec();
+                // TODO WTF
+                let slice: &'static [u8] = unsafe { std::mem::transmute(view.as_slice()) };
+                let v = <[T]>::try_ref_from_bytes(slice)?;
+                let v = v.into_iter().cloned().collect();
+                Poll::Ready(Ok(v))
+            }
+            Poll::Pending => {
+                project.waker.lock().unwrap().replace(cx.waker().clone());
+                Poll::Pending
+            }
         }
     }
 }
 
-fn async_map(device: &Device, buffer: Buffer) -> impl Future<Output = Result<Vec<u8>>> + '_ {
+fn async_map<T: Immutable + Clone + 'static>(
+    device: &Device,
+    buffer: Buffer,
+) -> impl Future<Output = Result<Vec<T>>> + '_
+where
+    [T]: TryFromBytes,
+{
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+    let waker_clone = waker.clone();
     buffer.map_async(MapMode::Read, .., move |result| {
         tx.send(result).unwrap();
+        if let Some(waker) = waker_clone.lock().unwrap().take() {
+            waker.wake();
+        }
     });
     BufferMapFuture {
         device,
         buffer,
         inner: async { Result::Ok(rx.await??) },
+        waker,
+        _t: PhantomData,
     }
 }
 
@@ -85,7 +206,11 @@ impl GpuFunc {
 struct CalcSizes(GpuFunc);
 
 impl CalcSizes {
-    pub fn call(&self, queue: &Queue, texture: &Texture) -> Result<(SubmissionIndex, Buffer)> {
+    pub fn call(
+        &self,
+        queue: &Queue,
+        texture: &Texture,
+    ) -> Result<(SubmissionIndex, InspectableBuffer)> {
         let mut encoder = self
             .0
             .device
@@ -95,12 +220,8 @@ impl CalcSizes {
         let texture_size = texture.size();
         let num_pixels = texture_size.width * texture_size.height;
         let offsets_size_bytes = usize::try_from(num_pixels).unwrap() * std::mem::size_of::<u32>();
-        let offsets_buffer = self.0.device.create_buffer(&BufferDescriptor {
-            label: Some("sizes_offsets"),
-            size: offsets_size_bytes.try_into().unwrap(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let offsets_buffer =
+            InspectableBuffer::new(&self.0.device, "sizes_offsets", offsets_size_bytes)?;
 
         let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
             label: Some("calc_sizes_bind_group"),
@@ -138,7 +259,7 @@ impl PrefixSum {
     pub fn call(
         &self,
         queue: &Queue,
-        buffer: &Buffer,
+        buffer: &InspectableBuffer,
         input_stride: u32,
     ) -> Result<SubmissionIndex> {
         let mut encoder = self
@@ -186,7 +307,11 @@ impl PrefixSum {
 struct AddPartialSums(GpuFunc);
 
 impl AddPartialSums {
-    pub fn call(&self, queue: &Queue, buffer: &Buffer) -> Result<(SubmissionIndex, Buffer)> {
+    pub fn call(
+        &self,
+        queue: &Queue,
+        buffer: &InspectableBuffer,
+    ) -> Result<(SubmissionIndex, InspectableBuffer)> {
         let mut encoder = self
             .0
             .device
@@ -194,12 +319,11 @@ impl AddPartialSums {
                 label: Some("add_partial_sums"),
             });
         let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
-        let total_size = self.0.device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_buffer"),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            size: std::mem::size_of::<u32>().try_into().unwrap(),
-            mapped_at_creation: false,
-        });
+        let total_size = InspectableBuffer::new(
+            &self.0.device,
+            "total_size_buffer",
+            std::mem::size_of::<u32>(),
+        )?;
         let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
             label: Some("add_partial_sums"),
             layout: &self.0.pipeline.get_bind_group_layout(0),
@@ -236,33 +360,19 @@ impl EncodeAnsi {
         &self,
         queue: &Queue,
         texture: &Texture,
-        offsets: &Buffer,
-        total_size_device: &Buffer,
-    ) -> Result<(SubmissionIndex, Buffer, Buffer)> {
+        offsets: &InspectableBuffer,
+    ) -> Result<(SubmissionIndex, InspectableBuffer)> {
         let texture_size = texture.size();
         let num_pixels = texture_size.width * texture_size.height;
-        let total_size_host_buffer = self.0.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_host"),
-            size: std::mem::size_of::<u32>().try_into()?,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let max_output_size_bytes: usize = usize::try_from(num_pixels)?
             * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len()
             + usize::try_from(texture_size.height)? * "\x1b[0m\n".len();
         let rounded_max_output_size_bytes = max_output_size_bytes.div_ceil(4) * 4;
-        let output_device_buffer = self.0.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_device"),
-            size: rounded_max_output_size_bytes.try_into()?,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let output_host_buffer = self.0.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_host"),
-            size: rounded_max_output_size_bytes.try_into()?,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let output_buffer = InspectableBuffer::new(
+            &self.0.device,
+            "ansi_output_device",
+            rounded_max_output_size_bytes,
+        )?;
         dbg!(max_output_size_bytes);
 
         let mut encoder = self
@@ -288,7 +398,7 @@ impl EncodeAnsi {
                 },
                 BindGroupEntry {
                     binding: 2,
-                    resource: output_device_buffer.as_entire_binding(),
+                    resource: output_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -303,26 +413,7 @@ impl EncodeAnsi {
             compute_pass.dispatch_workgroups(num_pixels, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(
-            &total_size_device,
-            0,
-            &total_size_host_buffer,
-            0,
-            total_size_host_buffer.size(),
-        );
-        encoder.copy_buffer_to_buffer(
-            &output_device_buffer,
-            0,
-            &output_host_buffer,
-            0,
-            output_host_buffer.size(),
-        );
-
-        Ok((
-            queue.submit(Some(encoder.finish())),
-            total_size_host_buffer,
-            output_host_buffer,
-        ))
+        Ok((queue.submit(Some(encoder.finish())), output_buffer))
     }
 }
 
@@ -397,30 +488,18 @@ impl GpuAnsiEncoder {
             let _ = self.prefix_sum.call(&self.queue, &offsets, stride)?;
             stride *= 256;
         }
-        let (_, total_size_device) = self.add_partial_sums.call(&self.queue, &offsets)?;
-        let (submission_index, total_size_host_buffer, output_host_buffer) = self
-            .encode_ansi
-            .call(&self.queue, texture, &offsets, &total_size_device)?;
+        let (_, total_size_buffer) = self.add_partial_sums.call(&self.queue, &offsets)?;
+        let (_, output_buffer) = self.encode_ansi.call(&self.queue, texture, &offsets)?;
+        self.device.poll(PollType::wait_indefinitely())?;
 
-        let total_size_fut = async {
-            let bytes = async_map(&self.device, total_size_host_buffer).await?;
-            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
-            Result::<u32>::Ok(u32s[0])
-        };
-        let output_fut = async {
-            let mut bytes = async_map(&self.device, output_host_buffer).await?;
-            eprintln!("bytes size was {}", bytes.len());
-            bytes.shrink_to(usize::try_from(total_size_fut.await?)?);
-            eprintln!("bytes size is {}", bytes.len());
-            Result::<String>::Ok(unsafe { String::from_utf8_unchecked(bytes) })
-        };
+        let size = total_size_buffer
+            .read::<u32>(&self.device, &self.queue)
+            .await?[0];
+        let mut output = output_buffer.read::<u8>(&self.device, &self.queue).await?;
+        output.shrink_to(usize::try_from(size)?);
+        let s = unsafe { String::from_utf8_unchecked(output) };
 
-        self.device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })?;
-
-        Ok(output_fut.await?)
+        Ok(s)
     }
 }
 
@@ -449,14 +528,13 @@ mod tests {
     use itertools::Itertools;
     use std::rc::Rc;
     use wgpu::{
-        BufferDescriptor, BufferUsages, Device, MapMode, Queue, ShaderModuleDescriptor,
-        ShaderSource, TextureDescriptor, TextureFormat, TextureUsages,
-        util::{BufferInitDescriptor, DeviceExt},
-        wgt::CommandEncoderDescriptor,
+        Device, PollType, Queue, ShaderModuleDescriptor, ShaderSource, TextureDescriptor,
+        TextureFormat, TextureUsages, util::DeviceExt,
     };
+    use zerocopy::IntoBytes;
 
     use crate::gpu_ansi_encoder::{
-        AddPartialSums, CalcSizes, EncodeAnsi, GpuFunc, PrefixSum, async_map,
+        AddPartialSums, CalcSizes, EncodeAnsi, GpuFunc, InspectableBuffer, PrefixSum,
     };
 
     async fn get_device() -> Result<(Rc<Device>, Queue)> {
@@ -498,43 +576,10 @@ mod tests {
             pixels,
         );
 
-        let num_outputs = texture_size.0 * ((texture_size.1 + 1) / 2);
-        let sizes_buffer_size = (num_outputs * std::mem::size_of::<u32>() as u32) as u64;
-
-        let staging_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("staging_buffer"),
-            size: sizes_buffer_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_encoder"),
-        });
-
         let (_, sizes_buffer) = calc_sizes.call(&queue, &texture)?;
+        device.poll(PollType::wait_indefinitely())?;
 
-        encoder.copy_buffer_to_buffer(&sizes_buffer, 0, &staging_buffer, 0, sizes_buffer_size);
-
-        let submission_index = queue.submit(Some(encoder.finish()));
-
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        buffer_slice.map_async(MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-
-        device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })?;
-
-        rx.await??;
-
-        let data = buffer_slice.get_mapped_range();
-        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
-
-        Ok(result)
+        Ok(sizes_buffer.read::<u32>(&device, &queue).await?)
     }
 
     #[tokio::test]
@@ -607,51 +652,13 @@ mod tests {
         });
         let prefix_sum = PrefixSum(GpuFunc::from_shader(device.clone(), &shader, "prefix_sum"));
 
-        let sizes_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("sizes_buffer"),
-            contents: bytemuck::cast_slice(sizes),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        });
-
-        let sizes_staging_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("sizes_staging_buffer"),
-            size: sizes_buffer.size(),
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_encoder"),
-        });
+        let sizes_buffer =
+            InspectableBuffer::new_with_data(&device, "sizes_buffer", sizes.as_bytes())?;
 
         prefix_sum.call(&queue, &sizes_buffer, stride)?;
+        device.poll(PollType::wait_indefinitely())?;
 
-        encoder.copy_buffer_to_buffer(
-            &sizes_buffer,
-            0,
-            &sizes_staging_buffer,
-            0,
-            sizes_buffer.size(),
-        );
-
-        let submission_index = queue.submit(Some(encoder.finish()));
-
-        let sizes_slice = sizes_staging_buffer.slice(..);
-        let (sizes_tx, sizes_rx) = tokio::sync::oneshot::channel();
-        sizes_slice.map_async(MapMode::Read, move |result| {
-            sizes_tx.send(result).unwrap();
-        });
-
-        device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })?;
-
-        sizes_rx.await??;
-
-        let sizes_data = sizes_slice.get_mapped_range();
-        let offsets: Vec<u32> = bytemuck::cast_slice(&sizes_data).to_vec();
-
+        let offsets = sizes_buffer.read::<u32>(&device, &queue).await?;
         Ok(offsets)
     }
 
@@ -721,37 +728,16 @@ mod tests {
             pixels,
         );
 
-        let offsets_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("offsets_buffer"),
-            contents: bytemuck::cast_slice(&offsets),
-            usage: BufferUsages::STORAGE,
-        });
-        let total_size_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("total_size"),
-            contents: bytemuck::cast_slice(&total_size.to_le_bytes()),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        });
+        let offsets_buffer =
+            InspectableBuffer::new_with_data(&device, "offsets_buffer", offsets.as_bytes())?;
 
-        let (submission_index, total_size_buffer, output_buffer) =
-            encode_ansi.call(&queue, &texture, &offsets_buffer, &total_size_buffer)?;
+        let (_, output_buffer) = encode_ansi.call(&queue, &texture, &offsets_buffer)?;
+        device.poll(PollType::wait_indefinitely())?;
 
-        let total_size_fut = async {
-            let bytes = async_map(&device, total_size_buffer).await?;
-            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
-            Result::<u32>::Ok(u32s[0])
-        };
-        let output_fut = async {
-            let bytes = async_map(&device, output_buffer).await?;
-            let slice = &bytes[..usize::try_from(total_size_fut.await?)?];
-            Result::<String>::Ok(String::from_utf8_lossy(slice).into_owned())
-        };
-
-        device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(submission_index),
-            timeout: None,
-        })?;
-
-        Ok(output_fut.await?)
+        let mut output = output_buffer.read::<u8>(&device, &queue).await?;
+        output.shrink_to(usize::try_from(total_size)?);
+        let s = unsafe { String::from_utf8_unchecked(output) };
+        Ok(s)
     }
 
     #[tokio::test]
@@ -857,54 +843,15 @@ mod tests {
             "add_partial_sums",
         ));
 
-        let values_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("offsets_buffer"),
-            contents: bytemuck::cast_slice(&values),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        });
-        let values_buffer_host = device.create_buffer(&BufferDescriptor {
-            label: Some("offsets_buffer_host"),
-            size: values_buffer.size(),
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let total_size_host = device.create_buffer(&BufferDescriptor {
-            label: Some("total_size_host"),
-            size: std::mem::size_of::<u32>().try_into()?,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let values_buffer =
+            InspectableBuffer::new_with_data(&device, "offsets_buffer", values.as_bytes())?;
 
-        let (_, total_size) = add_partial_sums.call(&queue, &values_buffer)?;
+        let (_, total_size_buffer) = add_partial_sums.call(&queue, &values_buffer)?;
+        device.poll(PollType::wait_indefinitely())?;
 
-        let mut encoder = device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(
-            &values_buffer,
-            0,
-            &values_buffer_host,
-            0,
-            values_buffer_host.size(),
-        );
-        encoder.copy_buffer_to_buffer(&total_size, 0, &total_size_host, 0, total_size_host.size());
-        let si = queue.submit(Some(encoder.finish()));
-
-        let total_size_fut = async {
-            let bytes = async_map(&device, total_size_host).await?;
-            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
-            Result::<u32>::Ok(u32s[0])
-        };
-        let values_fut = async {
-            let bytes = async_map(&device, values_buffer_host).await?;
-            let u32s: Vec<u32> = bytemuck::cast_slice(bytes.as_slice()).to_vec();
-            Result::<Vec<u32>>::Ok(u32s)
-        };
-
-        device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(si),
-            timeout: None,
-        })?;
-
-        Ok((values_fut.await?, total_size_fut.await?))
+        let values = values_buffer.read::<u32>(&device, &queue).await?;
+        let total_size = total_size_buffer.read::<u32>(&device, &queue).await?[0];
+        Ok((values, total_size))
     }
 
     #[tokio::test]
