@@ -6,7 +6,9 @@ mod gpu_ansi_encoder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    console_subscriber::init();
+    if std::env::var("CONSOLE_SUBSCRIBER").is_ok() {
+        console_subscriber::init();
+    }
 
     let instance = wgpu::Instance::default();
     let adapter = instance
@@ -44,8 +46,7 @@ async fn main() -> Result<()> {
     );
 
     let ansi_encoder = gpu_ansi_encoder::GpuAnsiEncoder::new(device, queue).await?;
-    loop {
-        let s = ansi_encoder.ansi_from_texture(&texture).await?;
-        print!("{s}");
-    }
+    let s = ansi_encoder.ansi_from_texture(&texture).await?;
+    print!("{s}");
+    Ok(())
 }
