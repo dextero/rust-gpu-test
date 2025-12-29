@@ -147,6 +147,7 @@ where
                 let slice: &'static [u8] = unsafe { std::mem::transmute(view.as_slice()) };
                 let v = <[T]>::try_ref_from_bytes(slice)?;
                 let v = v.into_iter().cloned().collect();
+                project.buffer.unmap();
                 Poll::Ready(Ok(v))
             }
             Poll::Pending => {
@@ -217,7 +218,7 @@ impl CalcSizes {
                 label: Some("calc_sizes"),
             });
         let texture_size = texture.size();
-        let num_pixels = texture_size.width * texture_size.height;
+        let num_pixels = texture_size.width * (texture_size.height + 1) / 2;
         let offsets_size_bytes = usize::try_from(num_pixels).unwrap() * std::mem::size_of::<u32>();
         let offsets_buffer =
             InspectableBuffer::new(&self.0.device, "sizes_offsets", offsets_size_bytes)?;
@@ -490,18 +491,22 @@ impl GpuAnsiEncoder {
         let num_pixels = texture_size.width * texture_size.height;
 
         let (_, offsets) = self.calc_sizes.call(&self.queue, texture)?;
+        eprintln!("sizes = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
         let mut stride = 1;
         while stride < num_pixels {
             let _ = self.prefix_sum.call(&self.queue, &offsets, stride)?;
+            eprintln!("[stride = {stride}] offsets = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
             stride *= 256;
         }
         let (_, total_size_buffer) = self.add_partial_sums.call(&self.queue, &offsets)?;
+        eprintln!("offsets = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
         let (_, output_buffer) = self.encode_ansi.call(&self.queue, texture, &offsets)?;
         self.device.poll(PollType::wait_indefinitely())?;
 
         let size = total_size_buffer
             .read::<u32>(&self.device, &self.queue)
             .await?[0];
+        eprintln!("size = {size}");
         let mut output = output_buffer.read::<u8>(&self.device, &self.queue).await?;
         output.shrink_to(usize::try_from(size)?);
         let s = unsafe { String::from_utf8_unchecked(output) };
