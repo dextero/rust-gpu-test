@@ -10,13 +10,19 @@ fn add_partial_sums(@builtin(num_workgroups) num_workgroups: vec3<u32>,
                     @builtin(local_invocation_id) local_id: vec3<u32>) {
     let elems = arrayLength(&buffer);
     let elems_per_workgroup = (elems + num_workgroups.x - 1u) / num_workgroups.x;
+    let begin = workgroup_id.x * elems_per_workgroup;
+    let end = min(begin + elems_per_workgroup, elems);
 
-    for (var i = local_id.x; i < elems_per_workgroup; i += WORKGROUP_SIZE) {
-        let src_idx = (i & WORKGROUP_SIZE) - 1u;
+    var i: u32;
+    for (i = begin + local_id.x; i < end; i += WORKGROUP_SIZE) {
+        if ((i + 1) % WORKGROUP_SIZE) == 0 {
+            continue;
+        }
+        let src_idx = (i & ~(WORKGROUP_SIZE - 1u)) - 1u;
         buffer[i] += buffer[src_idx];
     }
 
-    if (workgroup_id.x == num_workgroups.x - 1 && local_id.x == WORKGROUP_SIZE - 1) {
-        total_size = buffer[elems - 1];
+    if (i == elems - 1) {
+        total_size = buffer[i];
     }
 }

@@ -8,7 +8,6 @@ use wgpu::BindingResource;
 use wgpu::Buffer;
 use wgpu::BufferDescriptor;
 use wgpu::BufferUsages;
-use wgpu::BufferView;
 use wgpu::ComputePipeline;
 use wgpu::Device;
 use wgpu::MapMode;
@@ -45,7 +44,7 @@ where
 
         let project = self.project();
         match project.inner.poll(cx) {
-            Poll::Ready(val) => Poll::Ready(Ok(project.buffer.get_mapped_range(..).to_vec())),
+            Poll::Ready(_) => Poll::Ready(Ok(project.buffer.get_mapped_range(..).to_vec())),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -409,7 +408,9 @@ impl GpuAnsiEncoder {
         };
         let output_fut = async {
             let mut bytes = async_map(&self.device, output_host_buffer).await?;
+            eprintln!("bytes size was {}", bytes.len());
             bytes.shrink_to(usize::try_from(total_size_fut.await?)?);
+            eprintln!("bytes size is {}", bytes.len());
             Result::<String>::Ok(unsafe { String::from_utf8_unchecked(bytes) })
         };
 
@@ -418,8 +419,7 @@ impl GpuAnsiEncoder {
             timeout: None,
         })?;
 
-        let s = unsafe { String::from_utf8_unchecked(output_fut.await?.into()) };
-        Ok(s)
+        Ok(output_fut.await?)
     }
 }
 
@@ -445,14 +445,18 @@ pub fn gen_pixels(width: usize, height: usize) -> Vec<u8> {
 mod tests {
     use anyhow::Result;
     use insta::assert_debug_snapshot;
+    use itertools::Itertools;
     use std::rc::Rc;
     use wgpu::{
         BufferDescriptor, BufferUsages, Device, MapMode, Queue, ShaderModuleDescriptor,
         ShaderSource, TextureDescriptor, TextureFormat, TextureUsages,
         util::{BufferInitDescriptor, DeviceExt},
+        wgt::CommandEncoderDescriptor,
     };
 
-    use crate::gpu_ansi_encoder::{CalcSizes, EncodeAnsi, GpuFunc, PrefixSum, async_map};
+    use crate::gpu_ansi_encoder::{
+        AddPartialSums, CalcSizes, EncodeAnsi, GpuFunc, PrefixSum, async_map,
+    };
 
     async fn get_device() -> Result<(Rc<Device>, Queue)> {
         let instance = wgpu::Instance::default();
@@ -602,7 +606,7 @@ mod tests {
         });
         let prefix_sum = PrefixSum(GpuFunc::from_shader(device.clone(), &shader, "prefix_sum"));
 
-        let sizes_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let sizes_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("sizes_buffer"),
             contents: bytemuck::cast_slice(sizes),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
@@ -716,7 +720,7 @@ mod tests {
             pixels,
         );
 
-        let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let offsets_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("offsets_buffer"),
             contents: bytemuck::cast_slice(&offsets),
             usage: BufferUsages::STORAGE,
@@ -837,6 +841,90 @@ mod tests {
         assert_debug_snapshot!(
             run_encode_ansi_test(&RAINBOW_4X3, (4, 3), &[35, 37, 36, 41, 20, 19, 20, 24]).await?
         );
+        Ok(())
+    }
+
+    async fn run_add_partial_sums_test(values: &[u32]) -> Result<(Vec<u32>, u32)> {
+        let (device, queue) = get_device().await?;
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(include_str!("wgsl/add_partial_sums.wgsl").into()),
+        });
+        let add_partial_sums = AddPartialSums(GpuFunc::from_shader(
+            device.clone(),
+            &shader,
+            "add_partial_sums",
+        ));
+
+        let values_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("offsets_buffer"),
+            contents: bytemuck::cast_slice(&values),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let values_buffer_host = device.create_buffer(&BufferDescriptor {
+            label: Some("offsets_buffer_host"),
+            size: values_buffer.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let total_size_host = device.create_buffer(&BufferDescriptor {
+            label: Some("total_size_host"),
+            size: std::mem::size_of::<u32>().try_into()?,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let (_, total_size) = add_partial_sums.call(&queue, &values_buffer)?;
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(
+            &values_buffer,
+            0,
+            &values_buffer_host,
+            0,
+            values_buffer_host.size(),
+        );
+        encoder.copy_buffer_to_buffer(&total_size, 0, &total_size_host, 0, total_size_host.size());
+        let si = queue.submit(Some(encoder.finish()));
+
+        let total_size_fut = async {
+            let bytes = async_map(&device, total_size_host).await?;
+            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
+            Result::<u32>::Ok(u32s[0])
+        };
+        let values_fut = async {
+            let bytes = async_map(&device, values_buffer_host).await?;
+            let u32s: Vec<u32> = bytemuck::cast_slice(bytes.as_slice()).to_vec();
+            Result::<Vec<u32>>::Ok(u32s)
+        };
+
+        device.poll(wgpu::wgt::PollType::Wait {
+            submission_index: Some(si),
+            timeout: None,
+        })?;
+
+        Ok((values_fut.await?, total_size_fut.await?))
+    }
+
+    #[tokio::test]
+    async fn test_add_partial_sums() -> Result<()> {
+        let mut values: Vec<u32> = (1..=256).cycle().take(1024).collect();
+        for (prev, curr) in (1..=values.len() / 256)
+            .map(|x| usize::try_from(x).unwrap() * 256 - 1)
+            .tuple_windows::<(usize, usize)>()
+        {
+            values[curr] += values[prev];
+        }
+        eprintln!("values: {values:?}");
+        let (result, total_size) = run_add_partial_sums_test(&values).await?;
+        eprintln!("result: {result:?}");
+
+        assert_eq!(result.len(), 1024, "result len");
+        assert_eq!(total_size, 1024, "total size");
+        for (idx, &elem) in result.iter().enumerate() {
+            assert_eq!(idx + 1, usize::try_from(elem)?, "at index {idx}");
+        }
+
         Ok(())
     }
 }

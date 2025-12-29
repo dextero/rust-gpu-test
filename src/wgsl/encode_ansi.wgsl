@@ -2,6 +2,8 @@
 @group(0) @binding(1) var<storage, read> offsets: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<u32>;
 
+const WORKGROUP_SIZE: u32 = 256;
+
 const ANSI_ESCAPE: u32 = 0x1b;
 const ASCII_LEFT_BRACKET: u32 = 0x5b;
 const ASCII_ZERO: u32 = 0x30;
@@ -79,16 +81,15 @@ fn append_rgba(appender: ptr<function, Appender>,
     append(appender, ASCII_LOWERCASE_M);
 }
 
-@compute @workgroup_size(256)
-fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
+fn encode_single_char(char_pos: vec2<u32>) {
     let tex_dims = textureDimensions(input, 0);
-    let pos_top = vec2(id.x, id.y * 2);
-    let pos_bot = vec2(id.x, id.y * 2 + 1);
+    let pos_top = vec2(char_pos.x, char_pos.y * 2);
+    let pos_bot = vec2(pos_top.x, pos_top.y + 1);
     if (pos_top.x >= tex_dims.x || pos_top.y >= tex_dims.y) {
         return;
     }
 
-    let idx = id.y * tex_dims.x + id.x;
+    let idx = pos_top.y * tex_dims.x * 2 + pos_top.x;
     var cursor = 0u;
     if idx > 0 {
         cursor = offsets[idx - 1];
@@ -111,7 +112,7 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     append(&appender, UTF8_UPPER_HALF_BLOCK[0]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[1]);
     append(&appender, UTF8_UPPER_HALF_BLOCK[2]);
-    if (id.x == tex_dims.x - 1) {
+    if (pos_top.x == tex_dims.x - 1) {
         append(&appender, ANSI_ESCAPE);
         append(&appender, ASCII_LEFT_BRACKET);
         append(&appender, ASCII_ZERO);
@@ -119,4 +120,21 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
         append(&appender, ASCII_NEWLINE);
     }
     pad(&appender);
+}
+
+@compute @workgroup_size(WORKGROUP_SIZE)
+fn encode_ansi(@builtin(num_workgroups) num_workgroups: vec3<u32>,
+               @builtin(workgroup_id) workgroup_id: vec3<u32>,
+               @builtin(local_invocation_id) local_id: vec3<u32>) {
+    let tex_dims = textureDimensions(input, 0);
+    let total_chars = tex_dims.x * (tex_dims.y + 1) / 2;
+    let chars_per_workgroup = (total_chars + num_workgroups.x - 1) / num_workgroups.x;
+    let char_begin = workgroup_id.x * chars_per_workgroup;
+    let char_end = min(char_begin + chars_per_workgroup, total_chars);
+
+    for (var char_off = char_begin; char_off < char_end; char_off += WORKGROUP_SIZE) {
+        let idx = char_off + local_id.x;
+        let char_pos = vec2(idx % tex_dims.x, idx / tex_dims.x);
+        encode_single_char(char_pos);
+    }
 }
