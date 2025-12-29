@@ -89,7 +89,10 @@ fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let idx = id.y * tex_dims.x + id.x;
-    var cursor = offsets[idx] - offsets[0];
+    var cursor = 0u;
+    if idx > 0 {
+        cursor = offsets[idx - 1];
+    }
 
     var appender = Appender();
     appender.acc = 0;

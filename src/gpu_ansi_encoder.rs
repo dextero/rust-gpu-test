@@ -1,12 +1,15 @@
 use anyhow::Result;
+use pin_project::pin_project;
+use wgpu::BufferView;
+use wgpu::PollType;
 use std::rc::Rc;
+use std::task::Poll;
 use wgpu::BindGroupDescriptor;
 use wgpu::BindGroupEntry;
 use wgpu::BindingResource;
 use wgpu::Buffer;
 use wgpu::BufferDescriptor;
 use wgpu::BufferUsages;
-use wgpu::CommandEncoder;
 use wgpu::ComputePipeline;
 use wgpu::Device;
 use wgpu::MapMode;
@@ -14,9 +17,50 @@ use wgpu::Queue;
 use wgpu::ShaderModule;
 use wgpu::ShaderModuleDescriptor;
 use wgpu::ShaderSource;
+use wgpu::SubmissionIndex;
 use wgpu::Texture;
 use wgpu::util::BufferInitDescriptor;
 use wgpu::util::DeviceExt;
+use wgpu::wgt::CommandEncoderDescriptor;
+
+#[pin_project]
+struct BufferMapFuture<'d, InnerFut: Future<Output = Result<()>>> {
+    device: &'d Device,
+    buffer: Buffer,
+    #[pin] inner: InnerFut,
+}
+
+impl<'d, InnerFut> Future for BufferMapFuture<'d, InnerFut>
+where InnerFut: Future<Output = Result<()>>{
+    type Output = Result<Vec<u8>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match self.device.poll(PollType::Poll) {
+            Ok(_) => {},
+            Err(e) => return Poll::Ready(Err(e.into())),
+        }
+
+        let project = self.project();
+        match project.inner.poll(cx) {
+            Poll::Ready(val) => Poll::Ready(Ok(project.buffer.get_mapped_range(..).to_vec())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn async_map(device: &Device, buffer: Buffer) -> impl Future<Output = Result<Vec<u8>>> + '_ {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    buffer.map_async(MapMode::Read, .., move |result| {
+        tx.send(result).unwrap();
+    });
+    BufferMapFuture {
+        device,
+        buffer,
+        inner: async {
+            Result::Ok(rx.await??)
+        }
+    }
+}
 
 struct GpuFunc {
     device: Rc<Device>,
@@ -41,7 +85,13 @@ impl GpuFunc {
 struct CalcSizes(GpuFunc);
 
 impl CalcSizes {
-    pub fn call(&self, encoder: &mut CommandEncoder, texture: &Texture) -> Buffer {
+    pub fn call(&self, queue: &Queue, texture: &Texture) -> Result<(SubmissionIndex, Buffer)> {
+        let mut encoder = self
+            .0
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("calc_sizes"),
+            });
         let texture_size = texture.size();
         let num_pixels = texture_size.width * texture_size.height;
         let offsets_size_bytes = usize::try_from(num_pixels).unwrap() * std::mem::size_of::<u32>();
@@ -68,22 +118,35 @@ impl CalcSizes {
                 },
             ],
         });
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("calc_sizes"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.0.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("calc_sizes"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.0.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+        }
 
-        offsets_buffer
+        Ok((queue.submit(Some(encoder.finish())), offsets_buffer))
     }
 }
 
 struct PrefixSum(GpuFunc);
 
 impl PrefixSum {
-    pub fn call(&self, encoder: &mut CommandEncoder, buffer: &Buffer, input_stride: u32) {
+    pub fn call(
+        &self,
+        queue: &Queue,
+        buffer: &Buffer,
+        input_stride: u32,
+    ) -> Result<SubmissionIndex> {
+        let mut encoder = self
+            .0
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("prefix_sum"),
+            });
         let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
         let num_threads = (buffer_size_elems / u64::from(input_stride)).min(128 * 256);
         let stride_buffer = self.0.device.create_buffer_init(&BufferInitDescriptor {
@@ -105,20 +168,31 @@ impl PrefixSum {
                 },
             ],
         });
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("prefix_sum"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.0.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(u32::try_from(num_threads).unwrap(), 1, 1);
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("prefix_sum"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.0.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups(u32::try_from(num_threads).unwrap(), 1, 1);
+        }
+
+        Ok(queue.submit(Some(encoder.finish())))
     }
 }
 
 struct AddPartialSums(GpuFunc);
 
 impl AddPartialSums {
-    pub fn call(&self, encoder: &mut CommandEncoder, buffer: &Buffer) -> Buffer {
+    pub fn call(&self, queue: &Queue, buffer: &Buffer) -> Result<(SubmissionIndex, Buffer)> {
+        let mut encoder = self
+            .0
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("add_partial_sums"),
+            });
         let buffer_size_elems = buffer.size() / u64::try_from(std::mem::size_of::<u32>()).unwrap();
         let total_size = self.0.device.create_buffer(&BufferDescriptor {
             label: Some("total_size_buffer"),
@@ -140,14 +214,18 @@ impl AddPartialSums {
                 },
             ],
         });
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("add_partial_sums"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.0.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(u32::try_from(buffer_size_elems).unwrap(), 1, 1);
-        total_size
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("add_partial_sums"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.0.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups(u32::try_from(buffer_size_elems).unwrap(), 1, 1);
+        }
+
+        Ok((queue.submit(Some(encoder.finish())), total_size))
     }
 }
 
@@ -156,11 +234,42 @@ struct EncodeAnsi(GpuFunc);
 impl EncodeAnsi {
     pub fn call(
         &self,
-        encoder: &mut CommandEncoder,
+        queue: &Queue,
         texture: &Texture,
-        output_offsets: &Buffer,
-        output: &Buffer,
-    ) {
+        offsets: &Buffer,
+        total_size_device: &Buffer,
+    ) -> Result<(SubmissionIndex, Buffer, Buffer)> {
+        let texture_size = texture.size();
+        let num_pixels = texture_size.width * texture_size.height;
+        let total_size_host_buffer = self.0.device.create_buffer(&BufferDescriptor {
+            label: Some("ansi_output_host"),
+            size: std::mem::size_of::<u32>().try_into()?,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let max_output_size_bytes: usize = usize::try_from(num_pixels)?
+            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len()
+            + usize::try_from(texture_size.height)? * "\x1b[0m\n".len();
+        let rounded_max_output_size_bytes = max_output_size_bytes.div_ceil(4) * 4;
+        let output_device_buffer = self.0.device.create_buffer(&BufferDescriptor {
+            label: Some("ansi_output_device"),
+            size: rounded_max_output_size_bytes.try_into()?,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let output_host_buffer = self.0.device.create_buffer(&BufferDescriptor {
+            label: Some("ansi_output_host"),
+            size: rounded_max_output_size_bytes.try_into()?,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .0
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("encode_ansi"),
+            });
         let num_pixels = (texture.size().width * texture.size().height).min(128 * 256);
         let bind_group = self.0.device.create_bind_group(&BindGroupDescriptor {
             label: Some("encode_ansi_bind_group"),
@@ -174,21 +283,45 @@ impl EncodeAnsi {
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: output_offsets.as_entire_binding(),
+                    resource: offsets.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding: 2,
-                    resource: output.as_entire_binding(),
+                    resource: output_device_buffer.as_entire_binding(),
                 },
             ],
         });
-        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("encode_ansi"),
-            timestamp_writes: None,
-        });
-        compute_pass.set_pipeline(&self.0.pipeline);
-        compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("encode_ansi"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.0.pipeline);
+            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &total_size_device,
+            0,
+            &total_size_host_buffer,
+            0,
+            total_size_host_buffer.size(),
+        );
+        encoder.copy_buffer_to_buffer(
+            &output_device_buffer,
+            0,
+            &output_host_buffer,
+            0,
+            output_host_buffer.size(),
+        );
+
+        Ok((
+            queue.submit(Some(encoder.finish())),
+            total_size_host_buffer,
+            output_host_buffer,
+        ))
     }
 }
 
@@ -256,60 +389,17 @@ impl GpuAnsiEncoder {
     pub async fn ansi_from_texture(&self, texture: &Texture) -> Result<String> {
         let texture_size = texture.size();
         let num_pixels = texture_size.width * texture_size.height;
-        let total_size_host_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_host"),
-            size: std::mem::size_of::<u32>().try_into()?,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let max_output_size_bytes: usize = usize::try_from(num_pixels)?
-            * "\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m\u{2580}".len()
-            + usize::try_from(texture_size.height)? * "\x1b[0m\n".len();
-        let rounded_max_output_size_bytes = max_output_size_bytes.div_ceil(4) * 4;
-        let output_device_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_device"),
-            size: rounded_max_output_size_bytes.try_into()?,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let output_host_buffer = self.device.create_buffer(&BufferDescriptor {
-            label: Some("ansi_output_host"),
-            size: rounded_max_output_size_bytes.try_into()?,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("encode_ansi"),
-            });
-
-        let offsets = self.calc_sizes.call(&mut encoder, texture);
+        let (_, offsets) = self.calc_sizes.call(&self.queue, texture)?;
         let mut stride = 1;
         while stride < num_pixels {
-            self.prefix_sum.call(&mut encoder, &offsets, stride);
+            let _ = self.prefix_sum.call(&self.queue, &offsets, stride)?;
             stride *= 256;
         }
-        let total_size_device_buffer = self.add_partial_sums.call(&mut encoder, &offsets);
-        self.encode_ansi
-            .call(&mut encoder, texture, &offsets, &output_device_buffer);
-
-        encoder.copy_buffer_to_buffer(
-            &total_size_device_buffer,
-            0,
-            &total_size_host_buffer,
-            0,
-            total_size_host_buffer.size(),
-        );
-        encoder.copy_buffer_to_buffer(
-            &output_device_buffer,
-            0,
-            &output_host_buffer,
-            0,
-            output_host_buffer.size(),
-        );
-        let index = self.queue.submit(Some(encoder.finish()));
+        let (_, total_size_device) = self.add_partial_sums.call(&self.queue, &offsets)?;
+        let (submission_index, total_size_host_buffer, output_host_buffer) = self
+            .encode_ansi
+            .call(&self.queue, texture, &offsets, &total_size_device)?;
 
         let (size_tx, size_rx) = tokio::sync::oneshot::channel();
         total_size_host_buffer.map_async(MapMode::Read, .., move |result| {
@@ -321,7 +411,7 @@ impl GpuAnsiEncoder {
         });
 
         self.device.poll(wgpu::wgt::PollType::Wait {
-            submission_index: Some(index),
+            submission_index: Some(submission_index),
             timeout: None,
         })?;
 
@@ -370,10 +460,11 @@ mod tests {
     use std::rc::Rc;
     use wgpu::{
         BufferDescriptor, BufferUsages, Device, MapMode, Queue, ShaderModuleDescriptor,
-        ShaderSource, TextureDescriptor, TextureFormat, TextureUsages, util::DeviceExt,
+        ShaderSource, TextureDescriptor, TextureFormat, TextureUsages,
+        util::{BufferInitDescriptor, DeviceExt},
     };
 
-    use crate::gpu_ansi_encoder::{CalcSizes, EncodeAnsi, GpuFunc, PrefixSum};
+    use crate::gpu_ansi_encoder::{CalcSizes, EncodeAnsi, GpuFunc, PrefixSum, async_map};
 
     async fn get_device() -> Result<(Rc<Device>, Queue)> {
         let instance = wgpu::Instance::default();
@@ -428,7 +519,7 @@ mod tests {
             label: Some("test_encoder"),
         });
 
-        let sizes_buffer = calc_sizes.call(&mut encoder, &texture);
+        let (_, sizes_buffer) = calc_sizes.call(&queue, &texture)?;
 
         encoder.copy_buffer_to_buffer(&sizes_buffer, 0, &staging_buffer, 0, sizes_buffer_size);
 
@@ -540,7 +631,7 @@ mod tests {
             label: Some("test_encoder"),
         });
 
-        prefix_sum.call(&mut encoder, &sizes_buffer, stride);
+        prefix_sum.call(&queue, &sizes_buffer, stride)?;
 
         encoder.copy_buffer_to_buffer(
             &sizes_buffer,
@@ -613,8 +704,8 @@ mod tests {
         let mut offsets = Vec::with_capacity(sizes.len());
         let mut current_offset = 0;
         for size in sizes {
-            offsets.push(current_offset);
             current_offset += *size;
+            offsets.push(current_offset);
         }
         let total_size = current_offset;
 
@@ -643,49 +734,35 @@ mod tests {
             contents: bytemuck::cast_slice(&offsets),
             usage: BufferUsages::STORAGE,
         });
-
-        let output_buffer_size = (total_size as u64).div_ceil(4) * 4;
-        let output_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("output_buffer"),
-            size: output_buffer_size,
+        let total_size_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("total_size"),
+            contents: bytemuck::cast_slice(&total_size.to_le_bytes()),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
         });
 
-        let staging_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("staging_buffer"),
-            size: output_buffer_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let (submission_index, total_size_buffer, output_buffer) =
+            encode_ansi.call(&queue, &texture, &offsets_buffer, &total_size_buffer)?;
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test_encoder"),
-        });
+        eprintln!("before futures");
+        let total_size_fut = async {
+            let bytes = async_map(&device, total_size_buffer).await?;
+            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
+            Result::<u32>::Ok(u32s[0])
+        };
+        let output_fut = async {
+            let bytes = async_map(&device, output_buffer).await?;
+            let slice = &bytes[..usize::try_from(total_size_fut.await?)?];
+            Result::<String>::Ok(String::from_utf8_lossy(slice).into_owned())
+        };
 
-        encode_ansi.call(&mut encoder, &texture, &offsets_buffer, &output_buffer);
-
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_buffer_size);
-
-        let submission_index = queue.submit(Some(encoder.finish()));
-
-        let buffer_slice = staging_buffer.slice(..);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        buffer_slice.map_async(MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-
+        eprintln!("before poll");
         device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
+        eprintln!("after poll");
 
-        rx.await??;
-
-        let data = buffer_slice.get_mapped_range();
-        let result = String::from_utf8_lossy(&data[..total_size as usize]).to_string();
-
-        Ok(result)
+        Ok(output_fut.await?)
     }
 
     #[tokio::test]
@@ -774,8 +851,7 @@ mod tests {
     #[tokio::test]
     async fn test_rainbow_4x3_encode_ansi() -> Result<()> {
         assert_debug_snapshot!(
-            run_encode_ansi_test(&RAINBOW_4X3, (4, 3), &[35, 37, 36, 41, 20, 19, 20, 24])
-                .await?
+            run_encode_ansi_test(&RAINBOW_4X3, (4, 3), &[35, 37, 36, 41, 20, 19, 20, 24]).await?
         );
         Ok(())
     }
