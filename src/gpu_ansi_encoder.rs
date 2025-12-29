@@ -263,6 +263,7 @@ impl EncodeAnsi {
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        dbg!(max_output_size_bytes);
 
         let mut encoder = self
             .0
