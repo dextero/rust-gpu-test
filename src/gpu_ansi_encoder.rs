@@ -1,7 +1,5 @@
 use anyhow::Result;
 use pin_project::pin_project;
-use wgpu::BufferView;
-use wgpu::PollType;
 use std::rc::Rc;
 use std::task::Poll;
 use wgpu::BindGroupDescriptor;
@@ -10,9 +8,11 @@ use wgpu::BindingResource;
 use wgpu::Buffer;
 use wgpu::BufferDescriptor;
 use wgpu::BufferUsages;
+use wgpu::BufferView;
 use wgpu::ComputePipeline;
 use wgpu::Device;
 use wgpu::MapMode;
+use wgpu::PollType;
 use wgpu::Queue;
 use wgpu::ShaderModule;
 use wgpu::ShaderModuleDescriptor;
@@ -27,16 +27,19 @@ use wgpu::wgt::CommandEncoderDescriptor;
 struct BufferMapFuture<'d, InnerFut: Future<Output = Result<()>>> {
     device: &'d Device,
     buffer: Buffer,
-    #[pin] inner: InnerFut,
+    #[pin]
+    inner: InnerFut,
 }
 
 impl<'d, InnerFut> Future for BufferMapFuture<'d, InnerFut>
-where InnerFut: Future<Output = Result<()>>{
+where
+    InnerFut: Future<Output = Result<()>>,
+{
     type Output = Result<Vec<u8>>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match self.device.poll(PollType::Poll) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => return Poll::Ready(Err(e.into())),
         }
 
@@ -56,9 +59,7 @@ fn async_map(device: &Device, buffer: Buffer) -> impl Future<Output = Result<Vec
     BufferMapFuture {
         device,
         buffer,
-        inner: async {
-            Result::Ok(rx.await??)
-        }
+        inner: async { Result::Ok(rx.await??) },
     }
 }
 
@@ -401,36 +402,23 @@ impl GpuAnsiEncoder {
             .encode_ansi
             .call(&self.queue, texture, &offsets, &total_size_device)?;
 
-        let (size_tx, size_rx) = tokio::sync::oneshot::channel();
-        total_size_host_buffer.map_async(MapMode::Read, .., move |result| {
-            size_tx.send(result).unwrap();
-        });
-        let (output_tx, output_rx) = tokio::sync::oneshot::channel();
-        output_host_buffer.map_async(MapMode::Read, .., move |result| {
-            output_tx.send(result).unwrap();
-        });
+        let total_size_fut = async {
+            let bytes = async_map(&self.device, total_size_host_buffer).await?;
+            let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
+            Result::<u32>::Ok(u32s[0])
+        };
+        let output_fut = async {
+            let mut bytes = async_map(&self.device, output_host_buffer).await?;
+            bytes.shrink_to(usize::try_from(total_size_fut.await?)?);
+            Result::<String>::Ok(unsafe { String::from_utf8_unchecked(bytes) })
+        };
 
         self.device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
 
-        size_rx.await??;
-        output_rx.await??;
-
-        let size: usize = u32::from_le_bytes(
-            total_size_host_buffer
-                .get_mapped_range(..)
-                .iter()
-                .as_slice()
-                .try_into()?,
-        )
-        .try_into()?;
-
-        eprintln!("size = {} ({:#x})", size, size);
-        let rounded_size = u64::try_from(size.div_ceil(4) * 4)?;
-        let bytes = output_host_buffer.get_mapped_range(..rounded_size)[..size].to_vec();
-        let s = unsafe { String::from_utf8_unchecked(bytes) };
+        let s = unsafe { String::from_utf8_unchecked(output_fut.await?.into()) };
         Ok(s)
     }
 }
@@ -649,11 +637,10 @@ mod tests {
             sizes_tx.send(result).unwrap();
         });
 
-        let status = device.poll(wgpu::wgt::PollType::Wait {
+        device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
-        dbg!(status);
 
         sizes_rx.await??;
 
@@ -743,7 +730,6 @@ mod tests {
         let (submission_index, total_size_buffer, output_buffer) =
             encode_ansi.call(&queue, &texture, &offsets_buffer, &total_size_buffer)?;
 
-        eprintln!("before futures");
         let total_size_fut = async {
             let bytes = async_map(&device, total_size_buffer).await?;
             let u32s: &[u32] = bytemuck::cast_slice(bytes.as_slice());
@@ -755,12 +741,10 @@ mod tests {
             Result::<String>::Ok(String::from_utf8_lossy(slice).into_owned())
         };
 
-        eprintln!("before poll");
         device.poll(wgpu::wgt::PollType::Wait {
             submission_index: Some(submission_index),
             timeout: None,
         })?;
-        eprintln!("after poll");
 
         Ok(output_fut.await?)
     }

@@ -79,7 +79,7 @@ fn append_rgba(appender: ptr<function, Appender>,
     append(appender, ASCII_LOWERCASE_M);
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(256)
 fn encode_ansi(@builtin(global_invocation_id) id: vec3<u32>) {
     let tex_dims = textureDimensions(input, 0);
     let pos_top = vec2(id.x, id.y * 2);
