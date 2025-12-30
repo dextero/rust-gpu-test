@@ -28,6 +28,17 @@ use wgpu::util::DeviceExt;
 use zerocopy::Immutable;
 use zerocopy::TryFromBytes;
 
+const WORKGROUP_SIZE: usize = 256;
+
+fn workgroups_from_items<T, E>(n: T) -> Result<u32>
+where
+    T: TryInto<usize, Error = E>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let workgroups = (n.try_into()? + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    Ok(workgroups.try_into()?)
+}
+
 struct InspectableBuffer {
     device_buffer: Buffer,
     host_buffer: Buffer,
@@ -246,7 +257,7 @@ impl CalcSizes {
             });
             compute_pass.set_pipeline(&self.0.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+            compute_pass.dispatch_workgroups(workgroups_from_items(num_pixels)?, 1, 1);
         }
 
         Ok((queue.submit(Some(encoder.finish())), offsets_buffer))
@@ -346,7 +357,7 @@ impl AddPartialSums {
             });
             compute_pass.set_pipeline(&self.0.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(u32::try_from(buffer_size_elems).unwrap(), 1, 1);
+            compute_pass.dispatch_workgroups(workgroups_from_items(buffer_size_elems)?, 1, 1);
         }
 
         Ok((queue.submit(Some(encoder.finish())), total_size))
@@ -410,7 +421,7 @@ impl EncodeAnsi {
             });
             compute_pass.set_pipeline(&self.0.pipeline);
             compute_pass.set_bind_group(0, &bind_group, &[]);
-            compute_pass.dispatch_workgroups(num_pixels, 1, 1);
+            compute_pass.dispatch_workgroups(workgroups_from_items(num_pixels)?, 1, 1);
         }
 
         Ok((queue.submit(Some(encoder.finish())), output_buffer))
@@ -491,15 +502,24 @@ impl GpuAnsiEncoder {
         let num_pixels = texture_size.width * texture_size.height;
 
         let (_, offsets) = self.calc_sizes.call(&self.queue, texture)?;
-        eprintln!("sizes = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
+        eprintln!(
+            "sizes = {:?}",
+            offsets.read::<u32>(&self.device, &self.queue).await?
+        );
         let mut stride = 1;
         while stride < num_pixels {
             let _ = self.prefix_sum.call(&self.queue, &offsets, stride)?;
-            eprintln!("[stride = {stride}] offsets = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
+            eprintln!(
+                "[stride = {stride}] offsets = {:?}",
+                offsets.read::<u32>(&self.device, &self.queue).await?
+            );
             stride *= 256;
         }
         let (_, total_size_buffer) = self.add_partial_sums.call(&self.queue, &offsets)?;
-        eprintln!("offsets = {:?}", offsets.read::<u32>(&self.device, &self.queue).await?);
+        eprintln!(
+            "offsets = {:?}",
+            offsets.read::<u32>(&self.device, &self.queue).await?
+        );
         let (_, output_buffer) = self.encode_ansi.call(&self.queue, texture, &offsets)?;
         self.device.poll(PollType::wait_indefinitely())?;
 
