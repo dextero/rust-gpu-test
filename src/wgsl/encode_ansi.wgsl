@@ -89,7 +89,7 @@ fn encode_single_char(char_pos: vec2<u32>) {
         return;
     }
 
-    let idx = pos_top.y * tex_dims.x * 2 + pos_top.x;
+    let idx = char_pos.y * tex_dims.x + char_pos.x;
     var cursor = 0u;
     if idx > 0 {
         cursor = offsets[idx - 1];
